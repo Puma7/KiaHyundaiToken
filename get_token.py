@@ -1,7 +1,6 @@
 import os
 import re
 import shutil
-import sys
 
 from selenium import webdriver
 from selenium.webdriver.chrome.service import Service
@@ -41,10 +40,10 @@ BRANDS = {
             "https://idpconnect-eu.hyundai.com/auth/api/v2/user/oauth2/authorize"
             "?client_id=peuhyundaiidm-ctb"
             "&redirect_uri=https%3A%2F%2Fctbapi.hyundai-europe.com%2Fapi%2Fauth"
-            "&nonce=&state=EN_&scope=openid+profile+email+phone&response_type=code"
+            "&nonce=&state=PL_&scope=openid+profile+email+phone&response_type=code"
             "&connector_client_id=peuhyundaiidm-ctb"
             "&connector_scope=&connector_session_key=&country=&captcha=1"
-            "&ui_locales=en-US&lang=en"
+            "&ui_locales=en-US"
         ),
         "success_selector": "button.mail_check",
         "redirect_url_final": "https://prd.eu-ccapi.hyundai.com:8080/api/v1/user/oauth2/token",
@@ -58,54 +57,70 @@ USER_AGENT = (
 )
 
 
+def _build_chrome_options():
+    """Create a fresh ChromeOptions instance with anti-detection flags."""
+    chrome_options = webdriver.ChromeOptions()
+    chrome_options.add_argument(f"user-agent={USER_AGENT}")
+    chrome_options.add_argument("--disable-blink-features=AutomationControlled")
+    return chrome_options
+
+
 def install_chromedriver():
-    """Install a matching chromedriver, exit if Chrome is not found."""
+    """Install a matching chromedriver. Raises RuntimeError on failure."""
     try:
         chromedriver_autoinstaller.get_chrome_version()
     except Exception:
-        print(
-            "[ERROR] Google Chrome not found. "
+        raise RuntimeError(
+            "Google Chrome not found. "
             "Please install Google Chrome and try again."
         )
-        sys.exit(1)
     try:
         return chromedriver_autoinstaller.install()
     except Exception as e:
-        print(f"[ERROR] Failed to install chromedriver: {e}")
-        sys.exit(1)
+        raise RuntimeError(f"Failed to install chromedriver: {e}") from e
+
+
+def _is_safe_to_delete(driver_path):
+    """Only allow deletion of chromedriver-autoinstaller managed directories."""
+    driver_dir = os.path.dirname(os.path.abspath(driver_path))
+    # chromedriver-autoinstaller installs into a versioned subdirectory
+    # e.g. /home/user/.../125.0.6422.78/chromedriver
+    # Only delete if the directory name looks like a Chrome version number
+    dirname = os.path.basename(driver_dir)
+    return bool(re.match(r"^\d+\.\d+\.\d+(\.\d+)?$", dirname))
 
 
 def create_driver():
     """
     Install chromedriver and start Chrome with anti-detection flags.
     Retries once with a clean reinstall if the first attempt fails.
+    Raises RuntimeError if Chrome cannot be started.
     """
     driver_path = install_chromedriver()
 
-    chrome_options = webdriver.ChromeOptions()
-    chrome_options.add_argument(f"user-agent={USER_AGENT}")
-    chrome_options.add_argument("--window-size=1000,800")
-    chrome_options.add_argument("--disable-blink-features=AutomationControlled")
-
     try:
         service = Service(driver_path)
-        return webdriver.Chrome(service=service, options=chrome_options)
+        driver = webdriver.Chrome(service=service, options=_build_chrome_options())
+        driver.maximize_window()
+        return driver
     except WebDriverException:
-        # Clean up broken install and retry once
-        try:
-            driver_dir = os.path.dirname(driver_path)
-            if os.path.exists(driver_dir):
-                shutil.rmtree(driver_dir, ignore_errors=True)
-        except Exception:
-            pass
+        # Clean up broken install and retry once — only if path is safe
+        if _is_safe_to_delete(driver_path):
+            try:
+                shutil.rmtree(os.path.dirname(os.path.abspath(driver_path)))
+            except OSError:
+                pass
 
         try:
             driver_path = chromedriver_autoinstaller.install()
             service = Service(driver_path)
-            return webdriver.Chrome(service=service, options=chrome_options)
+            driver = webdriver.Chrome(service=service, options=_build_chrome_options())
+            driver.maximize_window()
+            return driver
         except Exception as e:
-            print(f"[ERROR] Could not start Chrome after reinstall: {e}")
-            sys.exit(1)
+            raise RuntimeError(
+                f"Could not start Chrome after reinstall: {e}"
+            ) from e
 
 
 def select_brand():
