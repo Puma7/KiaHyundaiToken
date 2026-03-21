@@ -1,6 +1,4 @@
 import re
-import signal
-import sys
 from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
@@ -9,16 +7,6 @@ from selenium.common.exceptions import TimeoutException
 import requests
 
 session = requests.Session()
-_driver = None
-
-def _cleanup(sig=None, frame=None):
-    if _driver:
-        _driver.quit()
-    sys.exit(1)
-
-signal.signal(signal.SIGINT, _cleanup)
-signal.signal(signal.SIGTERM, _cleanup)
-
 CLIENT_ID = "fdc85c00-0a2f-4c64-bcb4-2cfb1500730a"
 BASE_URL = "https://idpconnect-eu.kia.com/auth/api/v2/user/oauth2/"
 LOGIN_URL = f"{BASE_URL}authorize?ui_locales=de&scope=openid%20profile%20email%20phone&response_type=code&client_id=peukiaidm-online-sales&redirect_uri=https://www.kia.com/api/bin/oneid/login&state=aHR0cHM6Ly93d3cua2lhLmNvbTo0NDMvZGUvP21zb2NraWQ9MjM1NDU0ODBmNmUyNjg5NDIwMmU0MDBjZjc2OTY5NWQmX3RtPTE3NTYzMTg3MjY1OTImX3RtPTE3NTYzMjQyMTcxMjY=_default" 
@@ -28,11 +16,9 @@ REDIRECT_URL = f"{BASE_URL}authorize?response_type=code&client_id={CLIENT_ID}&re
 TOKEN_URL = f"{BASE_URL}token"
 
 def main():
-    global _driver
     options = webdriver.ChromeOptions()
     options.add_argument("user-agent=Mozilla/5.0 (Linux; Android 4.1.1; Galaxy Nexus Build/JRO03C) AppleWebKit/535.19 (KHTML, like Gecko) Chrome/18.0.1025.166 Mobile Safari/535.19_CCS_APP_AOS")
     driver = webdriver.Chrome(options=options)
-    _driver = driver
     driver.maximize_window()
 
     # 1. Open the login page
@@ -45,20 +31,26 @@ def main():
     print("="*50 + "\n")
 
     try:
-        wait = WebDriverWait(driver, 300) # 300-second timeout
-        wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, SUCCESS_ELEMENT_SELECTOR)))
+        try:
+            wait = WebDriverWait(driver, 300)
+            wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, SUCCESS_ELEMENT_SELECTOR)))
+        except TimeoutException:
+            raise Exception("Timed out after 5 minutes. Login was not completed or the success element was not found.")
+
         print("✅ Login successful! Element found.")
         driver.get(REDIRECT_URL)
 
-        wait = WebDriverWait(driver, 20)
-        wait.until(lambda d: "code=" in d.current_url or "error" in d.current_url)
+        try:
+            wait = WebDriverWait(driver, 20)
+            wait.until(lambda d: "code=" in d.current_url or "error" in d.current_url)
+        except TimeoutException:
+            raise Exception("Timed out waiting for OAuth redirect. The authorization server did not return a code.")
 
         current_url = driver.current_url
-        print(f"Redirected URL: {current_url}")
 
         match = re.search(r"[?&]code=([^&]+)", current_url)
         if not match:
-            raise Exception(f"Authorization code not found in URL: {current_url}")
+            raise Exception(f"Authorization code not found in redirect URL.")
 
         code = match.group(1)
         print("✅ Authorization code found.")
@@ -82,13 +74,11 @@ def main():
         else:
             print(f"\n❌ Error getting tokens from the API!\nStatus: {response.status_code}\n{response.text}")
 
-    except TimeoutException:
-        print("❌ Timed out after 5 minutes. Login was not completed or the success element was not found.")
     except Exception as e:
-        print(f"An unexpected error occurred: {e}")
+        print(f"❌ {e}")
     finally:
         print("Cleaning up and closing the browser.")
-        driver.quit()        
+        driver.quit()
 
 if __name__ == "__main__":
     main()

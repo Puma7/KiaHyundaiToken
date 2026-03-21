@@ -15,6 +15,7 @@ in once in a real browser and use the resulting **refresh token**.
 ## Requirements
 
 - Windows 10 or 11
+- [Git for Windows](https://git-scm.com/download/win)
 - Google Chrome installed and up to date
 - Python 3.10 or newer
 
@@ -30,7 +31,8 @@ environment each time.
 # Clone or update the repository
 if (Test-Path "$env:TEMP\KiaHyundaiToken") {
     cd "$env:TEMP\KiaHyundaiToken"
-    git pull origin main
+    git fetch origin main
+    git reset --hard origin/main
 } else {
     git clone https://github.com/Puma7/KiaHyundaiToken.git "$env:TEMP\KiaHyundaiToken"
     cd "$env:TEMP\KiaHyundaiToken"
@@ -60,7 +62,7 @@ which causes `ModuleNotFoundError` even though you just installed the packages.
 ### Running again later
 
 Just paste the same block again. It will:
-1. Pull the latest code from `main`
+1. Reset to the latest code from `main`
 2. Rebuild the virtual environment from scratch (avoids stale packages)
 3. Run the script
 
@@ -128,6 +130,11 @@ python -m pip install --upgrade pip
 
 - Ensure outbound connections to `prd.eu-ccapi.kia.com:8080` are allowed.
 - VPNs, proxies, and firewalls can interfere — try a different network.
+
+### `Remove-Item .venv` fails / "file in use"
+
+An orphaned Python process from a previous crashed run may lock files inside
+`.venv`. Close **all** PowerShell windows, then open a fresh one and retry.
 
 ### Lost or compromised refresh token
 
