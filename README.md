@@ -19,11 +19,45 @@ in once in a real browser and use the resulting **refresh token**.
 - Google Chrome installed and up to date
 - Python 3.10 or newer
 
-No browser extensions are required.
+No browser extensions are required. **No admin rights needed.**
+
+## Before you start
+
+### Opening PowerShell
+
+1. Press the **Windows key**, type **PowerShell**, and click
+   **"Windows PowerShell"** (not "as Administrator" — you do not need admin
+   rights).
+
+### One-time setup: allow scripts
+
+On a fresh Windows installation, PowerShell blocks all scripts by default.
+You only need to run this **once** — it stays set permanently:
+
+```powershell
+Set-ExecutionPolicy -Scope CurrentUser RemoteSigned
+```
+
+Type **Y** and press Enter when prompted.
+
+### How pasting works
+
+In this guide you will copy a block of commands and paste it into PowerShell.
+
+- **Windows Terminal / new PowerShell:** right-click into the window or press
+  `Ctrl+V` to paste.
+- **Classic PowerShell (blue window):** right-click into the window to paste.
+
+After pasting, **press Enter once**. All commands run automatically from top
+to bottom. At the end a Chrome window will open — that is expected, do not
+close it.
 
 ## Quick Start
 
-Open **PowerShell** and paste the entire block below.
+Copy the **entire gray block** below, paste it into PowerShell, and press
+Enter. Everything runs automatically until a Chrome window opens for you to
+log in.
+
 It is safe to run repeatedly — it will update the code and recreate the
 environment each time.
 
@@ -66,15 +100,21 @@ Just paste the same block again. It will:
 2. Rebuild the virtual environment from scratch (avoids stale packages)
 3. Run the script
 
-## What happens
+## What happens after you paste
 
-1. A Chrome window opens with the mobile user-agent that Kia expects.
-2. Log in to your Kia account and solve the reCAPTCHA manually.
-3. After login succeeds, the script completes the OAuth flow and prints:
+1. PowerShell downloads the code and installs dependencies (takes a few
+   seconds, you don't need to do anything).
+2. A **Chrome window opens automatically** — this is expected. **Do not close
+   it.**
+3. The Kia login page appears. Log in with your email and password, and solve
+   the reCAPTCHA.
+4. After login succeeds, the script finishes the OAuth flow automatically.
+   Switch back to PowerShell — it will show:
    - **Refresh Token** — use this as your "password" in clients
    - **Access Token** — usually not needed
+5. Chrome closes by itself. You are done.
 
-Store the refresh token securely (e.g. in a password manager).
+Copy the **Refresh Token** and store it securely (e.g. in a password manager).
 
 ## Using the token in Home Assistant
 
@@ -130,6 +170,28 @@ python -m pip install --upgrade pip
 
 - Ensure outbound connections to `prd.eu-ccapi.kia.com:8080` are allowed.
 - VPNs, proxies, and firewalls can interfere — try a different network.
+
+### `py` is not recognized
+
+If Python was installed via the **Microsoft Store**, the `py` launcher may
+not be available. Replace `py -m venv .venv` in the Quick Start with:
+
+```powershell
+python -m venv .venv
+```
+
+If neither `py` nor `python` works, Python is not installed or not in your
+PATH. Download it from [python.org](https://www.python.org/downloads/) and
+make sure to check **"Add Python to PATH"** during installation.
+
+### Script is disabled / execution policy error
+
+If you see *"running scripts is disabled on this system"*, run the one-time
+fix from the **Before you start** section above:
+
+```powershell
+Set-ExecutionPolicy -Scope CurrentUser RemoteSigned
+```
 
 ### `Remove-Item .venv` fails / "file in use"
 
