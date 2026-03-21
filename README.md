@@ -1,13 +1,14 @@
 # KiaHyundaiToken
 
-Get your Kia (EU) OAuth2 refresh token via a one-time browser login.
+Get your **Kia** or **Hyundai** (EU) OAuth2 refresh token via a one-time
+browser login.
 
 ## Why this exists
 
-Kia's EU login flow requires solving a Google reCAPTCHA. Because CAPTCHAs
-cannot be automated reliably, most API clients (e.g. Home Assistant
-integrations) no longer accept your Kia password directly. Instead, you log
-in once in a real browser and use the resulting **refresh token**.
+The Kia and Hyundai EU login flows require solving a Google reCAPTCHA.
+Because CAPTCHAs cannot be automated reliably, most API clients (e.g. Home
+Assistant integrations) no longer accept your password directly. Instead, you
+log in once in a real browser and use the resulting **refresh token**.
 
 > **Security:** Treat your refresh token like a password. Anyone who has it
 > can access your Kia account and vehicle data.
@@ -104,27 +105,29 @@ Just paste the same block again. It will:
 
 1. PowerShell downloads the code and installs dependencies (takes a few
    seconds, you don't need to do anything).
-2. A **Chrome window opens automatically** — this is expected. **Do not close
+2. The script asks you to **select your brand** (Kia or Hyundai). Type `1`
+   or `2` and press Enter.
+3. A **Chrome window opens automatically** — this is expected. **Do not close
    it.**
-3. The Kia login page appears. Log in with your email and password, and solve
+4. The login page appears. Log in with your email and password, and solve
    the reCAPTCHA.
-4. After login succeeds, the script finishes the OAuth flow automatically.
+5. After login succeeds, the script finishes the OAuth flow automatically.
    Switch back to PowerShell — it will show:
    - **Refresh Token** — use this as your "password" in clients
    - **Access Token** — usually not needed
-5. Chrome closes by itself. You are done.
+6. Chrome closes by itself. You are done.
 
 Copy the **Refresh Token** and store it securely (e.g. in a password manager).
 
 ## Using the token in Home Assistant
 
-In the Kia UVO / Kia Connect (EU) integration:
+In the Kia UVO / Hyundai Bluelink integration:
 
 | Field    | Value                                    |
 |----------|------------------------------------------|
 | Region   | EU                                       |
-| Brand    | Kia                                      |
-| Username | your Kia account email                   |
+| Brand    | Kia **or** Hyundai (match your choice)   |
+| Username | your account email                       |
 | Password | the **refresh token** from script output |
 | PIN      | only if the integration asks for one     |
 

@@ -1,5 +1,20 @@
 # Changelog
 
+## [1.3.0] - 2026-03-21
+
+### Fixed
+- Replace emoji (checkmark/cross) with ASCII `[OK]`/`[ERROR]` to prevent
+  `charmap` codec crash on Windows with legacy code page (cp1252)
+
+### Added
+- **Hyundai EU support** — script now prompts to select Kia or Hyundai at startup
+- Hyundai-specific OAuth endpoints, CLIENT_ID, CLIENT_SECRET, and login flow
+  (based on stefan-home's gist and community research)
+
+### Changed
+- Brand configuration moved into a `BRANDS` dict for clean multi-brand support
+- README updated for dual-brand (Kia + Hyundai EU)
+
 ## [1.2.1] - 2026-03-21
 
 ### Fixed
