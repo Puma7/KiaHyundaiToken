@@ -1,5 +1,39 @@
 # Changelog
 
+## [2.1.0] - 2026-03-21
+
+### Added
+- **Automatic ChromeDriver management** — chromedriver-autoinstaller
+  automatically downloads and installs the correct ChromeDriver version
+  matching your installed Chrome. No more manual driver setup.
+- **Anti-bot-detection flag** — `--disable-blink-features=AutomationControlled`
+  prevents websites from detecting Selenium automation, reducing the chance
+  of being blocked during login.
+- **Automatic retry on driver failure** — if ChromeDriver fails to start
+  (e.g. version mismatch after a Chrome update), the script automatically
+  cleans up and reinstalls the correct version before retrying.
+- **Safe cleanup guard** — the automatic retry only deletes directories
+  that match a ChromeDriver version pattern (e.g. `125.0.6422.78/`),
+  preventing accidental deletion of system directories.
+- New dependency: `chromedriver-autoinstaller>=0.6.2`
+
+### Changed
+- **User-Agent updated** from ancient Chrome 18 (Android) to modern
+  Chrome 125 (Windows desktop) for the default User-Agent string. The
+  `_CCS_APP_AOS` suffix is preserved. Per-brand overrides (e.g. Brazil's
+  iOS User-Agent) are unaffected.
+- ChromeOptions are now created via a `_build_chrome_options()` factory
+  function, ensuring a fresh instance on each driver start attempt
+  (prevents state leaking between retries).
+- Driver errors now raise `RuntimeError` instead of calling `sys.exit(1)`,
+  so the script is safe to import as a module and the `finally` cleanup
+  block always runs.
+
+### Fixed
+- Full exception chain preserved (`from e`) in all error paths within
+  `install_chromedriver()`, making it possible to debug unexpected
+  Chrome detection failures.
+
 ## [2.0.0] - 2026-03-21
 
 ### Added
