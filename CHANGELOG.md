@@ -1,5 +1,37 @@
 # Changelog
 
+## [2.0.0] - 2026-03-21
+
+### Added
+- **Global multi-region support** — Europe, China, Australia, New Zealand,
+  India, and Brazil with both Kia and Hyundai where available
+- Two-step selection flow: pick your region first, then your brand
+- Manual login fallback (press Enter) for regions without a known CSS
+  selector for automatic login detection
+- Per-region status labels (confirmed / experimental / untested) with
+  warnings shown at startup
+- "Contributing new regions" section in README
+- "About PINs" section in README explaining that PINs are only needed
+  for vehicle commands, not for token retrieval
+- Region/brand table in README showing supported combinations
+
+### Changed
+- **Breaking:** `BRANDS` dict replaced by nested `REGIONS` dict (region ->
+  brand hierarchy)
+- `select_brand()` replaced by `select_region_and_brand()` with two-step
+  prompts
+- User-Agent string is now per-brand (configurable in the REGIONS config)
+- Token URL and redirect URL are now explicit per-brand fields instead of
+  being derived from a single base URL
+- README rewritten for multi-region workflow
+
+### Notes
+- USA and Canada use a fundamentally different authentication method (direct
+  API login without browser). These regions are not yet supported but noted
+  in the README.
+- Untested regions have credentials sourced from the open-source project
+  `hyundai-kia-connect-api`. Community validation is needed.
+
 ## [1.3.0] - 2026-03-21
 
 ### Fixed

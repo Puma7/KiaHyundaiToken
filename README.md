@@ -1,26 +1,42 @@
 # KiaHyundaiToken
 
-Get your **Kia** or **Hyundai** (EU) OAuth2 refresh token via a one-time
-browser login.
+Get your **Kia** or **Hyundai** OAuth2 refresh token via a one-time browser
+login — worldwide.
 
-> **Note:** Kia EU is tested and confirmed working. Hyundai EU support is
-> **experimental** — it is based on community-provided OAuth values and has
-> not yet been validated with a real Hyundai account. If you are a Hyundai
-> user and it works (or doesn't), please open an issue so we can confirm.
+## Supported regions
+
+| # | Region       | Kia | Hyundai | Status |
+|---|--------------|-----|---------|--------|
+| 1 | Europe       | yes | yes     | Kia confirmed, Hyundai experimental |
+| 2 | China        | yes | yes     | untested |
+| 3 | Australia    | yes | yes     | untested |
+| 4 | New Zealand  | yes | —       | untested |
+| 5 | India        | yes | yes     | untested |
+| 6 | Brazil       | —   | yes     | untested |
+
+> **USA / Canada:** These regions use a different authentication method
+> (direct API login, no browser required). Most integrations (e.g. Home
+> Assistant) handle authentication directly for these regions — you typically
+> do not need this tool. If you need USA/Canada support, please open an issue.
+
+> **"Untested"** means the credentials are extracted from open-source projects
+> but have not been validated with a real account yet. If you can confirm a
+> region works (or doesn't), please open an issue.
 
 ## Why this exists
 
-The Kia and Hyundai EU login flows require solving a Google reCAPTCHA.
-Because CAPTCHAs cannot be automated reliably, most API clients (e.g. Home
-Assistant integrations) no longer accept your password directly. Instead, you
-log in once in a real browser and use the resulting **refresh token**.
+The Kia and Hyundai login flows (especially in Europe) require solving a
+Google reCAPTCHA. Because CAPTCHAs cannot be automated reliably, most API
+clients (e.g. Home Assistant integrations) no longer accept your password
+directly. Instead, you log in once in a real browser and use the resulting
+**refresh token**.
 
 > **Security:** Treat your refresh token like a password. Anyone who has it
 > can access your Kia or Hyundai account and vehicle data.
 
 ## Requirements
 
-- Windows 10 or 11
+- Windows 10 or 11 (also works on macOS / Linux with Chrome + Python)
 - [Git for Windows](https://git-scm.com/download/win)
 - Google Chrome installed and up to date
 - Python 3.10 or newer
@@ -55,9 +71,9 @@ In this guide you will copy a block of commands and paste it into PowerShell.
 - **Classic PowerShell (blue window):** right-click into the window to paste.
 
 After pasting, **press Enter once**. All commands run automatically from top
-to bottom. At the end the script will ask you to select your brand (Kia or
-Hyundai) — type `1` or `2` and press Enter. Then a Chrome window will
-open — that is expected, do not close it.
+to bottom. At the end the script will ask you to select your **region** and
+then your **brand** (Kia or Hyundai). A Chrome window will open — that is
+expected, do not close it.
 
 ## Quick Start
 
@@ -111,19 +127,28 @@ Just paste the same block again. It will:
 
 1. PowerShell downloads the code and installs dependencies (takes a few
    seconds, you don't need to do anything).
-2. The script asks you to **select your brand** (Kia or Hyundai). Type `1`
-   or `2` and press Enter.
-3. A **Chrome window opens automatically** — this is expected. **Do not close
+2. The script asks you to **select your region** (Europe, China, Australia,
+   etc.). Type the number and press Enter.
+3. The script asks you to **select your brand** (Kia or Hyundai). Type the
+   number and press Enter.
+4. A **Chrome window opens automatically** — this is expected. **Do not close
    it.**
-4. The login page appears. Log in with your email and password, and solve
-   the reCAPTCHA.
-5. After login succeeds, the script finishes the OAuth flow automatically.
-   Switch back to PowerShell — it will show:
-   - **Refresh Token** — use this as your "password" in clients
-   - **Access Token** — usually not needed
-6. Chrome closes by itself. You are done.
+5. The login page appears. Log in with your email and password, and solve
+   any CAPTCHA if prompted.
+6. **For Europe:** The script detects login automatically and finishes the
+   OAuth flow. Switch back to PowerShell to see your tokens.
+   **For other regions:** After logging in, switch back to PowerShell and
+   **press Enter** to continue. The script will then extract your tokens.
+7. Chrome closes by itself. You are done.
 
 Copy the **Refresh Token** and store it securely (e.g. in a password manager).
+
+## About PINs
+
+Some integrations (e.g. Home Assistant) ask for a **PIN** when sending
+vehicle commands (remote start, climate control, lock/unlock). This PIN is
+**not needed** by this tool — it only retrieves OAuth tokens. Enter the PIN
+in your integration when prompted.
 
 ## Using the token in Home Assistant
 
@@ -131,11 +156,27 @@ In the Kia UVO / Hyundai Bluelink integration:
 
 | Field    | Value                                    |
 |----------|------------------------------------------|
-| Region   | EU                                       |
+| Region   | match your selection above               |
 | Brand    | Kia **or** Hyundai (match your choice)   |
 | Username | your account email                       |
 | Password | the **refresh token** from script output |
 | PIN      | only if the integration asks for one     |
+
+## Contributing new regions
+
+If you are from a region that is marked "untested" or not listed, you can
+help:
+
+1. **Try it.** Run the script, select your region, and report whether it
+   works.
+2. **Report.** Open a GitHub issue with:
+   - Your region and brand
+   - Whether the login page loaded correctly
+   - Whether tokens were returned
+   - Any error messages
+3. **CSS selectors.** If the login page works but the script does not detect
+   login automatically (you had to press Enter), inspect the page after login
+   and report a CSS selector that uniquely identifies a post-login element.
 
 ## Troubleshooting
 
@@ -171,14 +212,15 @@ python -m pip install --upgrade pip
 ### Login succeeds but no tokens are printed
 
 - Keep the Chrome window visible during the entire flow.
-- Complete login fully, including the reCAPTCHA.
+- Complete login fully, including any CAPTCHA.
+- For non-EU regions: remember to **press Enter** in PowerShell after login.
 - If the script still does not detect the redirect, close everything and
   rerun from a fresh session.
 
 ### Network or access errors
 
-- Ensure outbound connections to `prd.eu-ccapi.kia.com:8080` (Kia) or
-  `prd.eu-ccapi.hyundai.com:8080` (Hyundai) are allowed.
+- Ensure outbound connections to the API endpoints for your region are
+  allowed (see the console output for the exact domain).
 - VPNs, proxies, and firewalls can interfere — try a different network.
 
 ### `py` is not recognized
