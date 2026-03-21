@@ -7,13 +7,16 @@
   `charmap` codec crash on Windows with legacy code page (cp1252)
 
 ### Added
-- **Hyundai EU support** — script now prompts to select Kia or Hyundai at startup
-- Hyundai-specific OAuth endpoints, CLIENT_ID, CLIENT_SECRET, and login flow
-  (based on stefan-home's gist and community research)
+- **Hyundai EU support** (experimental) — script now prompts to select Kia or
+  Hyundai at startup, with separate OAuth endpoints per brand
+- "Before you start" section in README: how to open PowerShell, one-time
+  execution policy fix (`Set-ExecutionPolicy`), how pasting works
+- Troubleshooting entries for `py` launcher missing, execution policy error
 
 ### Changed
 - Brand configuration moved into a `BRANDS` dict for clean multi-brand support
 - README updated for dual-brand (Kia + Hyundai EU)
+- Clarified that no admin rights are needed
 
 ## [1.2.1] - 2026-03-21
 

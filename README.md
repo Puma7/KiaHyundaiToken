@@ -16,7 +16,7 @@ Assistant integrations) no longer accept your password directly. Instead, you
 log in once in a real browser and use the resulting **refresh token**.
 
 > **Security:** Treat your refresh token like a password. Anyone who has it
-> can access your Kia account and vehicle data.
+> can access your Kia or Hyundai account and vehicle data.
 
 ## Requirements
 
@@ -55,8 +55,9 @@ In this guide you will copy a block of commands and paste it into PowerShell.
 - **Classic PowerShell (blue window):** right-click into the window to paste.
 
 After pasting, **press Enter once**. All commands run automatically from top
-to bottom. At the end a Chrome window will open — that is expected, do not
-close it.
+to bottom. At the end the script will ask you to select your brand (Kia or
+Hyundai) — type `1` or `2` and press Enter. Then a Chrome window will
+open — that is expected, do not close it.
 
 ## Quick Start
 
@@ -176,7 +177,8 @@ python -m pip install --upgrade pip
 
 ### Network or access errors
 
-- Ensure outbound connections to `prd.eu-ccapi.kia.com:8080` are allowed.
+- Ensure outbound connections to `prd.eu-ccapi.kia.com:8080` (Kia) or
+  `prd.eu-ccapi.hyundai.com:8080` (Hyundai) are allowed.
 - VPNs, proxies, and firewalls can interfere — try a different network.
 
 ### `py` is not recognized
