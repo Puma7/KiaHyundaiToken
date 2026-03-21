@@ -344,10 +344,15 @@ def main():
                 )
             print("[OK] Login successful!")
         else:
-            print("Press ENTER in this terminal after you have logged in.")
-            print("=" * 50 + "\n")
-            input(">> Press ENTER to continue after login... ")
-            print("[OK] Continuing...")
+            # Check if the redirect already happened while the user was
+            # still in the browser (code= already in the URL).
+            if "code=" in driver.current_url:
+                print("[OK] Authorization code already detected!")
+            else:
+                print("Press ENTER in this terminal after you have logged in.")
+                print("=" * 50 + "\n")
+                input(">> Press ENTER to continue after login... ")
+                print("[OK] Continuing...")
 
         # --- Step 2: obtain the authorization code ---------------------
         if brand.get("redirect_url"):
@@ -357,21 +362,21 @@ def main():
             try:
                 wait = WebDriverWait(driver, 20)
                 wait.until(
-                    lambda d: "code=" in d.current_url or "error" in d.current_url
+                    lambda d: "code=" in d.current_url or "error=" in d.current_url
                 )
             except TimeoutException:
                 raise Exception(
                     "Timed out waiting for OAuth redirect. "
                     "The authorization server did not return a code."
                 )
-        else:
+        elif "code=" not in driver.current_url:
             # Standard: the login page already redirected (or will
             # redirect) to redirect_url_final?code=...
             # Give it a generous timeout in case the redirect is slow.
             try:
                 wait = WebDriverWait(driver, 60)
                 wait.until(
-                    lambda d: "code=" in d.current_url or "error" in d.current_url
+                    lambda d: "code=" in d.current_url or "error=" in d.current_url
                 )
             except TimeoutException:
                 raise Exception(
@@ -381,7 +386,7 @@ def main():
 
         current_url = driver.current_url
 
-        if "error" in current_url and "code=" not in current_url:
+        if "error=" in current_url and "code=" not in current_url:
             raise Exception(f"OAuth error. Redirect URL: {current_url}")
 
         match = re.search(r"[?&]code=([^&]+)", current_url)
