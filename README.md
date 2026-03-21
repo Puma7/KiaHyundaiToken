@@ -25,9 +25,9 @@ No browser extensions are required.
 Open **PowerShell** and run these commands in order:
 
 ```powershell
-# Create a clean working directory
-mkdir $env:TEMP\kia-clean -ErrorAction SilentlyContinue
-cd $env:TEMP\kia-clean
+# Clone the repository
+git clone https://github.com/Puma7/KiaHyundaiToken.git
+cd KiaHyundaiToken
 
 # Create and activate a virtual environment
 py -m venv .venv
@@ -36,17 +36,13 @@ py -m venv .venv
 # Bootstrap and install dependencies (always use 'python', not 'py', inside a venv)
 python -m ensurepip --upgrade
 python -m pip install --upgrade pip
-python -m pip install --no-cache-dir selenium requests
-
-# Download the script
-iwr -UseBasicParsing -OutFile KiaFetchApiTokensSelenium.py `
-  https://gist.github.com/fuatakgun/fa4ef1e1d48b8dca2d22133d4d028dc9/raw/fe95ed7c02913f6277878a100458be78b794603d/gistfile1.txt
+python -m pip install -r requirements.txt
 
 # Verify the environment works
 python -c "from selenium.webdriver.common.by import By; import requests; print('environment ok')"
 
 # Run the script
-python .\KiaFetchApiTokensSelenium.py
+python get_token.py
 ```
 
 ### Important: `python` vs `py`
@@ -91,7 +87,7 @@ python -c "import sys; print(sys.executable)"
 ```
 
 If `pip show` fails or the executable is not inside `.venv`, you need a fresh
-environment. Follow the Quick Start steps using a **new folder name**.
+environment. Delete the folder and re-clone the repository.
 
 ### `No module named pip.__main__`
 
