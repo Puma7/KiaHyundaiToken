@@ -1,4 +1,4 @@
-# KiaHyundaiToken
+# KiaHyundaiToken v2.1.0
 
 Get your **Kia** or **Hyundai** OAuth2 refresh token via a one-time browser
 login — worldwide.
@@ -40,6 +40,9 @@ directly. Instead, you log in once in a real browser and use the resulting
 - [Git for Windows](https://git-scm.com/download/win)
 - Google Chrome installed and up to date
 - Python 3.10 or newer
+
+ChromeDriver is installed **automatically** — the script detects your Chrome
+version and downloads the matching driver on first run. No manual setup needed.
 
 No browser extensions are required. **No admin rights needed.**
 
@@ -208,6 +211,21 @@ python -m pip install --upgrade pip
 - Make sure Google Chrome is installed and up to date.
 - Close all existing Chrome windows and retry.
 - Some corporate networks block ChromeDriver downloads; try a home network.
+- If you see "Google Chrome not found", the auto-installer cannot detect your
+  Chrome installation. Verify Chrome is in a standard install location.
+
+### ChromeDriver version mismatch
+
+If Chrome updated recently, the cached ChromeDriver may be outdated. The script
+automatically detects this and reinstalls the correct version. If it still
+fails, delete the cached driver folder and rerun:
+
+```powershell
+# The folder is typically at:
+# Windows: ~\appdata\local\chromedriver_autoinstaller\
+# macOS/Linux: ~/.local/share/chromedriver_autoinstaller/
+# Then just rerun the Quick Start block.
+```
 
 ### Login succeeds but no tokens are printed
 
