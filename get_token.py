@@ -49,7 +49,7 @@ REGIONS = {
                 "client_secret": "secret",
                 "login_url": (
                     "https://idpconnect-eu.kia.com/auth/api/v2/user/oauth2/authorize"
-                    "?ui_locales=de&scope=openid%20profile%20email%20phone&response_type=code"
+                    "?ui_locales=en&scope=openid%20profile%20email%20phone&response_type=code"
                     "&client_id=peukiaidm-online-sales"
                     "&redirect_uri=https://www.kia.com/api/bin/oneid/login"
                     "&state=aHR0cHM6Ly93d3cua2lhLmNvbTo0NDMvZGUvP21zb2NraWQ9MjM1NDU0ODBm"
@@ -297,13 +297,14 @@ def select_region_and_brand():
         brand = brands[choice]
         print(f"\n-> {brand['name']} selected.\n")
 
-    if brand["status"] == "untested":
+    status = brand.get("status", "untested")
+    if status == "untested":
         print("=" * 60)
         print("WARNING: This region/brand combination has not been")
         print("validated yet. It may or may not work. If you can confirm")
         print("it works (or report issues), please open an issue on GitHub.")
         print("=" * 60 + "\n")
-    elif brand["status"] == "experimental":
+    elif status == "experimental":
         print("=" * 60)
         print("NOTE: This brand is experimental. It is based on")
         print("community-provided values and has not been fully validated.")
@@ -318,16 +319,18 @@ def main():
     user_agent = brand.get("user_agent", DEFAULT_USER_AGENT)
     options = webdriver.ChromeOptions()
     options.add_argument(f"user-agent={user_agent}")
-    driver = webdriver.Chrome(options=options)
-    driver.maximize_window()
 
-    print(f"Opening {brand['name']} ({region['name']}) login page...")
-    driver.get(brand["login_url"])
-
-    print("\n" + "=" * 50)
-    print("Please log in manually in the browser window.")
-
+    driver = None
     try:
+        driver = webdriver.Chrome(options=options)
+        driver.maximize_window()
+
+        print(f"Opening {brand['name']} ({region['name']}) login page...")
+        driver.get(brand["login_url"])
+
+        print("\n" + "=" * 50)
+        print("Please log in manually in the browser window.")
+
         # --- Step 1: wait for the user to complete login ---------------
         if brand.get("success_selector"):
             print("The script will detect your login automatically.")
@@ -350,6 +353,10 @@ def main():
                 print("[OK] Authorization code already detected!")
             else:
                 print("Press ENTER in this terminal after you have logged in.")
+                print("")
+                print("If the page does not show a login form, this region")
+                print("may not support browser-based login yet.")
+                print("Please open an issue on GitHub if that is the case.")
                 print("=" * 50 + "\n")
                 input(">> Press ENTER to continue after login... ")
                 print("[OK] Continuing...")
@@ -404,7 +411,7 @@ def main():
             "client_id": brand["client_id"],
             "client_secret": brand["client_secret"],
         }
-        response = session.post(brand["token_url"], data=data)
+        response = session.post(brand["token_url"], data=data, timeout=30)
         if response.status_code == 200:
             tokens = response.json()
             refresh_token = tokens.get("refresh_token")
@@ -426,11 +433,14 @@ def main():
                 f"Status: {response.status_code}\n{response.text}"
             )
 
+    except KeyboardInterrupt:
+        print("\n[ERROR] Interrupted by user.")
     except Exception as e:
         print(f"[ERROR] {e}")
     finally:
-        print("Cleaning up and closing the browser.")
-        driver.quit()
+        if driver:
+            print("Cleaning up and closing the browser.")
+            driver.quit()
 
 
 if __name__ == "__main__":
