@@ -1,10 +1,16 @@
+import os
 import re
+import shutil
+import sys
+
 from selenium import webdriver
+from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
-from selenium.common.exceptions import TimeoutException
+from selenium.common.exceptions import TimeoutException, WebDriverException
 import requests
+import chromedriver_autoinstaller
 
 session = requests.Session()
 
@@ -35,10 +41,10 @@ BRANDS = {
             "https://idpconnect-eu.hyundai.com/auth/api/v2/user/oauth2/authorize"
             "?client_id=peuhyundaiidm-ctb"
             "&redirect_uri=https%3A%2F%2Fctbapi.hyundai-europe.com%2Fapi%2Fauth"
-            "&nonce=&state=PL_&scope=openid+profile+email+phone&response_type=code"
+            "&nonce=&state=EN_&scope=openid+profile+email+phone&response_type=code"
             "&connector_client_id=peuhyundaiidm-ctb"
             "&connector_scope=&connector_session_key=&country=&captcha=1"
-            "&ui_locales=en-US"
+            "&ui_locales=en-US&lang=en"
         ),
         "success_selector": "button.mail_check",
         "redirect_url_final": "https://prd.eu-ccapi.hyundai.com:8080/api/v1/user/oauth2/token",
@@ -46,10 +52,60 @@ BRANDS = {
 }
 
 USER_AGENT = (
-    "Mozilla/5.0 (Linux; Android 4.1.1; Galaxy Nexus Build/JRO03C) "
-    "AppleWebKit/535.19 (KHTML, like Gecko) Chrome/18.0.1025.166 "
-    "Mobile Safari/535.19_CCS_APP_AOS"
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/125.0.0.0 Safari/537.36_CCS_APP_AOS"
 )
+
+
+def install_chromedriver():
+    """Install a matching chromedriver, exit if Chrome is not found."""
+    try:
+        chromedriver_autoinstaller.get_chrome_version()
+    except Exception:
+        print(
+            "[ERROR] Google Chrome not found. "
+            "Please install Google Chrome and try again."
+        )
+        sys.exit(1)
+    try:
+        return chromedriver_autoinstaller.install()
+    except Exception as e:
+        print(f"[ERROR] Failed to install chromedriver: {e}")
+        sys.exit(1)
+
+
+def create_driver():
+    """
+    Install chromedriver and start Chrome with anti-detection flags.
+    Retries once with a clean reinstall if the first attempt fails.
+    """
+    driver_path = install_chromedriver()
+
+    chrome_options = webdriver.ChromeOptions()
+    chrome_options.add_argument(f"user-agent={USER_AGENT}")
+    chrome_options.add_argument("--window-size=1000,800")
+    chrome_options.add_argument("--disable-blink-features=AutomationControlled")
+
+    try:
+        service = Service(driver_path)
+        return webdriver.Chrome(service=service, options=chrome_options)
+    except WebDriverException:
+        # Clean up broken install and retry once
+        try:
+            driver_dir = os.path.dirname(driver_path)
+            if os.path.exists(driver_dir):
+                shutil.rmtree(driver_dir, ignore_errors=True)
+        except Exception:
+            pass
+
+        try:
+            driver_path = chromedriver_autoinstaller.install()
+            service = Service(driver_path)
+            return webdriver.Chrome(service=service, options=chrome_options)
+        except Exception as e:
+            print(f"[ERROR] Could not start Chrome after reinstall: {e}")
+            sys.exit(1)
 
 
 def select_brand():
@@ -78,10 +134,7 @@ def main():
     )
     token_url = f"{base_url}token"
 
-    options = webdriver.ChromeOptions()
-    options.add_argument(f"user-agent={USER_AGENT}")
-    driver = webdriver.Chrome(options=options)
-    driver.maximize_window()
+    driver = create_driver()
 
     print(f"Opening {brand['name']} login page...")
     driver.get(brand["login_url"])
