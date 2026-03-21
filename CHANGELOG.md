@@ -1,5 +1,23 @@
 # Changelog
 
+## [1.3.0] - 2026-03-21
+
+### Fixed
+- Replace emoji (checkmark/cross) with ASCII `[OK]`/`[ERROR]` to prevent
+  `charmap` codec crash on Windows with legacy code page (cp1252)
+
+### Added
+- **Hyundai EU support** (experimental) — script now prompts to select Kia or
+  Hyundai at startup, with separate OAuth endpoints per brand
+- "Before you start" section in README: how to open PowerShell, one-time
+  execution policy fix (`Set-ExecutionPolicy`), how pasting works
+- Troubleshooting entries for `py` launcher missing, execution policy error
+
+### Changed
+- Brand configuration moved into a `BRANDS` dict for clean multi-brand support
+- README updated for dual-brand (Kia + Hyundai EU)
+- Clarified that no admin rights are needed
+
 ## [1.2.1] - 2026-03-21
 
 ### Fixed

@@ -7,78 +7,160 @@ from selenium.common.exceptions import TimeoutException
 import requests
 
 session = requests.Session()
-CLIENT_ID = "fdc85c00-0a2f-4c64-bcb4-2cfb1500730a"
-BASE_URL = "https://idpconnect-eu.kia.com/auth/api/v2/user/oauth2/"
-LOGIN_URL = f"{BASE_URL}authorize?ui_locales=de&scope=openid%20profile%20email%20phone&response_type=code&client_id=peukiaidm-online-sales&redirect_uri=https://www.kia.com/api/bin/oneid/login&state=aHR0cHM6Ly93d3cua2lhLmNvbTo0NDMvZGUvP21zb2NraWQ9MjM1NDU0ODBmNmUyNjg5NDIwMmU0MDBjZjc2OTY5NWQmX3RtPTE3NTYzMTg3MjY1OTImX3RtPTE3NTYzMjQyMTcxMjY=_default" 
-SUCCESS_ELEMENT_SELECTOR = "a[class='logout user']" 
-REDIRECT_URL_FINAL = "https://prd.eu-ccapi.kia.com:8080/api/v1/user/oauth2/redirect"
-REDIRECT_URL = f"{BASE_URL}authorize?response_type=code&client_id={CLIENT_ID}&redirect_uri={REDIRECT_URL_FINAL}&lang=de&state=ccsp"
-TOKEN_URL = f"{BASE_URL}token"
+
+BRANDS = {
+    "1": {
+        "name": "Kia",
+        "client_id": "fdc85c00-0a2f-4c64-bcb4-2cfb1500730a",
+        "client_secret": "secret",
+        "base_url": "https://idpconnect-eu.kia.com/auth/api/v2/user/oauth2/",
+        "login_url": (
+            "https://idpconnect-eu.kia.com/auth/api/v2/user/oauth2/authorize"
+            "?ui_locales=de&scope=openid%20profile%20email%20phone&response_type=code"
+            "&client_id=peukiaidm-online-sales"
+            "&redirect_uri=https://www.kia.com/api/bin/oneid/login"
+            "&state=aHR0cHM6Ly93d3cua2lhLmNvbTo0NDMvZGUvP21zb2NraWQ9MjM1NDU0ODBm"
+            "NmUyNjg5NDIwMmU0MDBjZjc2OTY5NWQmX3RtPTE3NTYzMTg3MjY1OTImX3RtPTE3"
+            "NTYzMjQyMTcxMjY=_default"
+        ),
+        "success_selector": "a[class='logout user']",
+        "redirect_url_final": "https://prd.eu-ccapi.kia.com:8080/api/v1/user/oauth2/redirect",
+    },
+    "2": {
+        "name": "Hyundai",
+        "client_id": "6d477c38-3ca4-4cf3-9557-2a1929a94654",
+        "client_secret": "KUy49XxPzLpLuoK0xhBC77W6VXhmtQR9iQhmIFjjoY4IpxsV",
+        "base_url": "https://idpconnect-eu.hyundai.com/auth/api/v2/user/oauth2/",
+        "login_url": (
+            "https://idpconnect-eu.hyundai.com/auth/api/v2/user/oauth2/authorize"
+            "?client_id=peuhyundaiidm-ctb"
+            "&redirect_uri=https%3A%2F%2Fctbapi.hyundai-europe.com%2Fapi%2Fauth"
+            "&nonce=&state=PL_&scope=openid+profile+email+phone&response_type=code"
+            "&connector_client_id=peuhyundaiidm-ctb"
+            "&connector_scope=&connector_session_key=&country=&captcha=1"
+            "&ui_locales=en-US"
+        ),
+        "success_selector": "button.mail_check",
+        "redirect_url_final": "https://prd.eu-ccapi.hyundai.com:8080/api/v1/user/oauth2/token",
+    },
+}
+
+USER_AGENT = (
+    "Mozilla/5.0 (Linux; Android 4.1.1; Galaxy Nexus Build/JRO03C) "
+    "AppleWebKit/535.19 (KHTML, like Gecko) Chrome/18.0.1025.166 "
+    "Mobile Safari/535.19_CCS_APP_AOS"
+)
+
+
+def select_brand():
+    print("Select your brand:\n")
+    print("  1) Kia (EU)")
+    print("  2) Hyundai (EU) -- experimental, needs community validation")
+    print()
+    while True:
+        choice = input("Enter 1 or 2: ").strip()
+        if choice in BRANDS:
+            brand = BRANDS[choice]
+            print(f"\n-> {brand['name']} selected.\n")
+            return brand
+        print("Invalid choice. Please enter 1 or 2.")
+
 
 def main():
+    brand = select_brand()
+
+    base_url = brand["base_url"]
+    redirect_url = (
+        f"{base_url}authorize?response_type=code"
+        f"&client_id={brand['client_id']}"
+        f"&redirect_uri={brand['redirect_url_final']}"
+        f"&lang=de&state=ccsp"
+    )
+    token_url = f"{base_url}token"
+
     options = webdriver.ChromeOptions()
-    options.add_argument("user-agent=Mozilla/5.0 (Linux; Android 4.1.1; Galaxy Nexus Build/JRO03C) AppleWebKit/535.19 (KHTML, like Gecko) Chrome/18.0.1025.166 Mobile Safari/535.19_CCS_APP_AOS")
+    options.add_argument(f"user-agent={USER_AGENT}")
     driver = webdriver.Chrome(options=options)
     driver.maximize_window()
 
-    # 1. Open the login page
-    print(f"Opening login page: {LOGIN_URL}")
-    driver.get(LOGIN_URL)
+    print(f"Opening {brand['name']} login page...")
+    driver.get(brand["login_url"])
 
-    print("\n" + "="*50)
+    print("\n" + "=" * 50)
     print("Please log in manually in the browser window.")
     print("The script will wait for you to complete the login...")
-    print("="*50 + "\n")
+    print("=" * 50 + "\n")
 
     try:
         try:
             wait = WebDriverWait(driver, 300)
-            wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, SUCCESS_ELEMENT_SELECTOR)))
+            wait.until(EC.presence_of_element_located(
+                (By.CSS_SELECTOR, brand["success_selector"])
+            ))
         except TimeoutException:
-            raise Exception("Timed out after 5 minutes. Login was not completed or the success element was not found.")
+            raise Exception(
+                "Timed out after 5 minutes. Login was not completed "
+                "or the success element was not found."
+            )
 
-        print("✅ Login successful! Element found.")
-        driver.get(REDIRECT_URL)
+        print("[OK] Login successful!")
+        driver.get(redirect_url)
 
         try:
             wait = WebDriverWait(driver, 20)
-            wait.until(lambda d: "code=" in d.current_url or "error" in d.current_url)
+            wait.until(
+                lambda d: "code=" in d.current_url or "error" in d.current_url
+            )
         except TimeoutException:
-            raise Exception("Timed out waiting for OAuth redirect. The authorization server did not return a code.")
+            raise Exception(
+                "Timed out waiting for OAuth redirect. "
+                "The authorization server did not return a code."
+            )
 
         current_url = driver.current_url
 
         match = re.search(r"[?&]code=([^&]+)", current_url)
         if not match:
-            raise Exception(f"Authorization code not found in redirect URL.")
+            raise Exception("Authorization code not found in redirect URL.")
 
         code = match.group(1)
-        print("✅ Authorization code found.")
+        print("[OK] Authorization code found.")
 
         data = {
             "grant_type": "authorization_code",
             "code": code,
-            "redirect_uri": REDIRECT_URL_FINAL,
-            "client_id": CLIENT_ID,
-            "client_secret": "secret",
+            "redirect_uri": brand["redirect_url_final"],
+            "client_id": brand["client_id"],
+            "client_secret": brand["client_secret"],
         }
-        response = session.post(TOKEN_URL, data=data)
+        response = session.post(token_url, data=data)
         if response.status_code == 200:
             tokens = response.json()
             refresh_token = tokens.get("refresh_token")
             access_token = tokens.get("access_token")
             if refresh_token and access_token:
-                print(f"\n✅ Your tokens are:\n\n- Refresh Token: {refresh_token}\n- Access Token: {access_token}")
+                print(
+                    f"\n[OK] Your tokens are:\n\n"
+                    f"- Refresh Token: {refresh_token}\n"
+                    f"- Access Token:  {access_token}"
+                )
             else:
-                print(f"\n❌ Token response did not contain expected fields:\n{tokens}")
+                print(
+                    f"\n[ERROR] Token response did not contain expected fields:\n"
+                    f"{tokens}"
+                )
         else:
-            print(f"\n❌ Error getting tokens from the API!\nStatus: {response.status_code}\n{response.text}")
+            print(
+                f"\n[ERROR] Error getting tokens from the API!\n"
+                f"Status: {response.status_code}\n{response.text}"
+            )
 
     except Exception as e:
-        print(f"❌ {e}")
+        print(f"[ERROR] {e}")
     finally:
         print("Cleaning up and closing the browser.")
         driver.quit()
+
 
 if __name__ == "__main__":
     main()
