@@ -55,7 +55,7 @@ USER_AGENT = (
 def select_brand():
     print("Select your brand:\n")
     print("  1) Kia (EU)")
-    print("  2) Hyundai (EU)")
+    print("  2) Hyundai (EU) -- experimental, needs community validation")
     print()
     while True:
         choice = input("Enter 1 or 2: ").strip()

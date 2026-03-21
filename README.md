@@ -3,6 +3,11 @@
 Get your **Kia** or **Hyundai** (EU) OAuth2 refresh token via a one-time
 browser login.
 
+> **Note:** Kia EU is tested and confirmed working. Hyundai EU support is
+> **experimental** — it is based on community-provided OAuth values and has
+> not yet been validated with a real Hyundai account. If you are a Hyundai
+> user and it works (or doesn't), please open an issue so we can confirm.
+
 ## Why this exists
 
 The Kia and Hyundai EU login flows require solving a Google reCAPTCHA.
