@@ -96,7 +96,7 @@ if (Test-Path "$env:TEMP\KiaHyundaiToken") {
 }
 
 # (Re)create a clean virtual environment
-deactivate 2>$null
+if (Get-Command deactivate -ErrorAction SilentlyContinue) { deactivate }
 if (Test-Path .venv) { Remove-Item -Recurse -Force .venv }
 py -m venv .venv
 .\.venv\Scripts\Activate.ps1
