@@ -1,4 +1,3 @@
-# main.py
 import re
 from selenium import webdriver
 from selenium.webdriver.common.by import By
@@ -17,12 +16,6 @@ REDIRECT_URL = f"{BASE_URL}authorize?response_type=code&client_id={CLIENT_ID}&re
 TOKEN_URL = f"{BASE_URL}token"
 
 def main():
-    """
-    Main function to run the Selenium automation.
-    """
-    # Initialize the Chrome WebDriver
-    # Make sure you have chromedriver installed and in your PATH,
-    # or specify the path to it.
     options = webdriver.ChromeOptions()
     options.add_argument("user-agent=Mozilla/5.0 (Linux; Android 4.1.1; Galaxy Nexus Build/JRO03C) AppleWebKit/535.19 (KHTML, like Gecko) Chrome/18.0.1025.166 Mobile Safari/535.19_CCS_APP_AOS")
     driver = webdriver.Chrome(options=options)
@@ -38,16 +31,30 @@ def main():
     print("="*50 + "\n")
 
     try:
-        wait = WebDriverWait(driver, 300) # 300-second timeout
-        wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, SUCCESS_ELEMENT_SELECTOR)))
+        try:
+            wait = WebDriverWait(driver, 300)
+            wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, SUCCESS_ELEMENT_SELECTOR)))
+        except TimeoutException:
+            raise Exception("Timed out after 5 minutes. Login was not completed or the success element was not found.")
+
         print("✅ Login successful! Element found.")
         driver.get(REDIRECT_URL)
-        wait = WebDriverWait(driver, 5) # 5-second timeout
+
+        try:
+            wait = WebDriverWait(driver, 20)
+            wait.until(lambda d: "code=" in d.current_url or "error" in d.current_url)
+        except TimeoutException:
+            raise Exception("Timed out waiting for OAuth redirect. The authorization server did not return a code.")
+
         current_url = driver.current_url
-        code = re.search(
-                r'code=([0-9a-fA-F-]{36}\.[0-9a-fA-F-]{36}\.[0-9a-fA-F-]{36})',
-                current_url
-            ).group(1)
+
+        match = re.search(r"[?&]code=([^&]+)", current_url)
+        if not match:
+            raise Exception(f"Authorization code not found in redirect URL.")
+
+        code = match.group(1)
+        print("✅ Authorization code found.")
+
         data = {
             "grant_type": "authorization_code",
             "code": code,
@@ -58,20 +65,20 @@ def main():
         response = session.post(TOKEN_URL, data=data)
         if response.status_code == 200:
             tokens = response.json()
-            if tokens is not None:
-                refresh_token = tokens["refresh_token"]
-                access_token = tokens["access_token"]
+            refresh_token = tokens.get("refresh_token")
+            access_token = tokens.get("access_token")
+            if refresh_token and access_token:
                 print(f"\n✅ Your tokens are:\n\n- Refresh Token: {refresh_token}\n- Access Token: {access_token}")
+            else:
+                print(f"\n❌ Token response did not contain expected fields:\n{tokens}")
         else:
-            print(f"\n❌ Error getting tokens from der API!\n{response.text}")
+            print(f"\n❌ Error getting tokens from the API!\nStatus: {response.status_code}\n{response.text}")
 
-    except TimeoutException:
-        print("❌ Timed out after 5 minutes. Login was not completed or the success element was not found.")
     except Exception as e:
-        print(f"An unexpected error occurred: {e}")
+        print(f"❌ {e}")
     finally:
         print("Cleaning up and closing the browser.")
-        driver.quit()        
+        driver.quit()
 
 if __name__ == "__main__":
     main()
