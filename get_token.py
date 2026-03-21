@@ -1,17 +1,22 @@
+import os
 import re
+import shutil
+
 from selenium import webdriver
+from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import TimeoutException, WebDriverException
 import requests
+import chromedriver_autoinstaller
 
 session = requests.Session()
 
 DEFAULT_USER_AGENT = (
-    "Mozilla/5.0 (Linux; Android 4.1.1; Galaxy Nexus Build/JRO03C) "
-    "AppleWebKit/535.19 (KHTML, like Gecko) Chrome/18.0.1025.166 "
-    "Mobile Safari/535.19_CCS_APP_AOS"
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/125.0.0.0 Safari/537.36_CCS_APP_AOS"
 )
 
 # ---------------------------------------------------------------------------
@@ -261,6 +266,72 @@ STATUS_LABELS = {
 }
 
 
+def _build_chrome_options(user_agent):
+    """Create a fresh ChromeOptions instance with anti-detection flags."""
+    chrome_options = webdriver.ChromeOptions()
+    chrome_options.add_argument(f"user-agent={user_agent}")
+    chrome_options.add_argument("--disable-blink-features=AutomationControlled")
+    return chrome_options
+
+
+def install_chromedriver():
+    """Install a matching chromedriver. Raises RuntimeError on failure."""
+    try:
+        chromedriver_autoinstaller.get_chrome_version()
+    except Exception as e:
+        raise RuntimeError(
+            "Google Chrome not found. "
+            "Please install Google Chrome and try again."
+        ) from e
+    try:
+        return chromedriver_autoinstaller.install()
+    except Exception as e:
+        raise RuntimeError(f"Failed to install chromedriver: {e}") from e
+
+
+def _is_safe_to_delete(driver_path):
+    """Only allow deletion of chromedriver-autoinstaller managed directories."""
+    driver_dir = os.path.dirname(os.path.abspath(driver_path))
+    # chromedriver-autoinstaller installs into a versioned subdirectory
+    # e.g. /home/user/.../125.0.6422.78/chromedriver
+    # Only delete if the directory name looks like a Chrome version number
+    dirname = os.path.basename(driver_dir)
+    return bool(re.match(r"^\d+\.\d+\.\d+(\.\d+)?$", dirname))
+
+
+def create_driver(user_agent):
+    """
+    Install chromedriver and start Chrome with anti-detection flags.
+    Retries once with a clean reinstall if the first attempt fails.
+    Raises RuntimeError if Chrome cannot be started.
+    """
+    driver_path = install_chromedriver()
+
+    try:
+        service = Service(driver_path)
+        driver = webdriver.Chrome(service=service, options=_build_chrome_options(user_agent))
+        driver.maximize_window()
+        return driver
+    except WebDriverException:
+        # Clean up broken install and retry once — only if path is safe
+        if _is_safe_to_delete(driver_path):
+            try:
+                shutil.rmtree(os.path.dirname(os.path.abspath(driver_path)))
+            except OSError:
+                pass
+
+        try:
+            driver_path = chromedriver_autoinstaller.install()
+            service = Service(driver_path)
+            driver = webdriver.Chrome(service=service, options=_build_chrome_options(user_agent))
+            driver.maximize_window()
+            return driver
+        except Exception as e:
+            raise RuntimeError(
+                f"Could not start Chrome after reinstall: {e}"
+            ) from e
+
+
 def select_region_and_brand():
     print("Select your region:\n")
     region_keys = list(REGIONS.keys())
@@ -317,13 +388,10 @@ def main():
     region, brand = select_region_and_brand()
 
     user_agent = brand.get("user_agent", DEFAULT_USER_AGENT)
-    options = webdriver.ChromeOptions()
-    options.add_argument(f"user-agent={user_agent}")
 
     driver = None
     try:
-        driver = webdriver.Chrome(options=options)
-        driver.maximize_window()
+        driver = create_driver(user_agent)
 
         print(f"Opening {brand['name']} ({region['name']}) login page...")
         driver.get(brand["login_url"])
