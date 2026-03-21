@@ -41,6 +41,10 @@
 - OAuth error detection tightened from `"error"` to `"error="` to avoid
   false positives on URLs containing the word "error" in their path
 - Defensive `brand.get("status")` instead of direct dict access
+- Clean error message when user closes Chrome manually (no more
+  chromedriver stacktrace)
+- `driver.quit()` in finally block protected against already-dead session
+- Quick Start: `deactivate` no longer shows red error on first run
 
 ### Notes
 - USA and Canada use a fundamentally different authentication method (direct

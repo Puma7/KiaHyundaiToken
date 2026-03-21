@@ -3,7 +3,7 @@ from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
-from selenium.common.exceptions import TimeoutException
+from selenium.common.exceptions import TimeoutException, WebDriverException
 import requests
 
 session = requests.Session()
@@ -435,12 +435,17 @@ def main():
 
     except KeyboardInterrupt:
         print("\n[ERROR] Interrupted by user.")
+    except WebDriverException:
+        print("[ERROR] Browser was closed. Please do not close Chrome manually.")
     except Exception as e:
         print(f"[ERROR] {e}")
     finally:
         if driver:
             print("Cleaning up and closing the browser.")
-            driver.quit()
+            try:
+                driver.quit()
+            except Exception:
+                pass
 
 
 if __name__ == "__main__":
