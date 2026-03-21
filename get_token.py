@@ -1,4 +1,6 @@
 import re
+import signal
+import sys
 from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
@@ -7,6 +9,16 @@ from selenium.common.exceptions import TimeoutException
 import requests
 
 session = requests.Session()
+_driver = None
+
+def _cleanup(sig=None, frame=None):
+    if _driver:
+        _driver.quit()
+    sys.exit(1)
+
+signal.signal(signal.SIGINT, _cleanup)
+signal.signal(signal.SIGTERM, _cleanup)
+
 CLIENT_ID = "fdc85c00-0a2f-4c64-bcb4-2cfb1500730a"
 BASE_URL = "https://idpconnect-eu.kia.com/auth/api/v2/user/oauth2/"
 LOGIN_URL = f"{BASE_URL}authorize?ui_locales=de&scope=openid%20profile%20email%20phone&response_type=code&client_id=peukiaidm-online-sales&redirect_uri=https://www.kia.com/api/bin/oneid/login&state=aHR0cHM6Ly93d3cua2lhLmNvbTo0NDMvZGUvP21zb2NraWQ9MjM1NDU0ODBmNmUyNjg5NDIwMmU0MDBjZjc2OTY5NWQmX3RtPTE3NTYzMTg3MjY1OTImX3RtPTE3NTYzMjQyMTcxMjY=_default" 
@@ -16,15 +28,11 @@ REDIRECT_URL = f"{BASE_URL}authorize?response_type=code&client_id={CLIENT_ID}&re
 TOKEN_URL = f"{BASE_URL}token"
 
 def main():
-    """
-    Main function to run the Selenium automation.
-    """
-    # Initialize the Chrome WebDriver
-    # Make sure you have chromedriver installed and in your PATH,
-    # or specify the path to it.
+    global _driver
     options = webdriver.ChromeOptions()
     options.add_argument("user-agent=Mozilla/5.0 (Linux; Android 4.1.1; Galaxy Nexus Build/JRO03C) AppleWebKit/535.19 (KHTML, like Gecko) Chrome/18.0.1025.166 Mobile Safari/535.19_CCS_APP_AOS")
     driver = webdriver.Chrome(options=options)
+    _driver = driver
     driver.maximize_window()
 
     # 1. Open the login page

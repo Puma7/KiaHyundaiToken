@@ -1,5 +1,17 @@
 # Changelog
 
+## [1.2.0] - 2026-03-21
+
+### Fixed
+- Quick Start now works on repeated runs (clone-or-pull, recreate venv each time)
+- Ctrl+C now properly closes Chrome instead of leaving orphaned processes
+- Minimum Selenium version bumped to 4.6.0 (required for automatic ChromeDriver management)
+
+### Changed
+- Quick Start uses `$env:TEMP\KiaHyundaiToken` as fixed location
+- `deactivate` called before recreating venv to avoid Permission Denied errors
+- Removed outdated comments about manual chromedriver installation
+
 ## [1.1.0] - 2026-03-21
 
 ### Fixed

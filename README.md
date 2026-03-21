@@ -22,34 +22,47 @@ No browser extensions are required.
 
 ## Quick Start
 
-Open **PowerShell** and run these commands in order:
+Open **PowerShell** and paste the entire block below.
+It is safe to run repeatedly — it will update the code and recreate the
+environment each time.
 
 ```powershell
-# Clone the repository
-git clone https://github.com/Puma7/KiaHyundaiToken.git
-cd KiaHyundaiToken
+# Clone or update the repository
+if (Test-Path "$env:TEMP\KiaHyundaiToken") {
+    cd "$env:TEMP\KiaHyundaiToken"
+    git pull origin main
+} else {
+    git clone https://github.com/Puma7/KiaHyundaiToken.git "$env:TEMP\KiaHyundaiToken"
+    cd "$env:TEMP\KiaHyundaiToken"
+}
 
-# Create and activate a virtual environment
+# (Re)create a clean virtual environment
+deactivate 2>$null
+if (Test-Path .venv) { Remove-Item -Recurse -Force .venv }
 py -m venv .venv
 .\.venv\Scripts\Activate.ps1
 
-# Bootstrap and install dependencies (always use 'python', not 'py', inside a venv)
+# Install dependencies (always use 'python', not 'py', inside a venv)
 python -m ensurepip --upgrade
 python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
 
-# Verify the environment works
-python -c "from selenium.webdriver.common.by import By; import requests; print('environment ok')"
-
-# Run the script
+# Run
 python get_token.py
 ```
 
-### Important: `python` vs `py`
+### Why `python` and not `py`?
 
 After activating a virtual environment, always use **`python`** (not `py`).
 `py` may invoke a different Python interpreter than the one inside your venv,
 which causes `ModuleNotFoundError` even though you just installed the packages.
+
+### Running again later
+
+Just paste the same block again. It will:
+1. Pull the latest code from `main`
+2. Rebuild the virtual environment from scratch (avoids stale packages)
+3. Run the script
 
 ## What happens
 
