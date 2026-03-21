@@ -278,11 +278,11 @@ def install_chromedriver():
     """Install a matching chromedriver. Raises RuntimeError on failure."""
     try:
         chromedriver_autoinstaller.get_chrome_version()
-    except Exception:
+    except Exception as e:
         raise RuntimeError(
             "Google Chrome not found. "
             "Please install Google Chrome and try again."
-        )
+        ) from e
     try:
         return chromedriver_autoinstaller.install()
     except Exception as e:
