@@ -42,12 +42,20 @@ def main():
         wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, SUCCESS_ELEMENT_SELECTOR)))
         print("✅ Login successful! Element found.")
         driver.get(REDIRECT_URL)
-        wait = WebDriverWait(driver, 5) # 5-second timeout
+
+        wait = WebDriverWait(driver, 20)
+        wait.until(lambda d: "code=" in d.current_url or "error" in d.current_url)
+
         current_url = driver.current_url
-        code = re.search(
-                r'code=([0-9a-fA-F-]{36}\.[0-9a-fA-F-]{36}\.[0-9a-fA-F-]{36})',
-                current_url
-            ).group(1)
+        print(f"Redirected URL: {current_url}")
+
+        match = re.search(r"[?&]code=([^&]+)", current_url)
+        if not match:
+            raise Exception(f"Authorization code not found in URL: {current_url}")
+
+        code = match.group(1)
+        print("✅ Authorization code found.")
+
         data = {
             "grant_type": "authorization_code",
             "code": code,
@@ -58,12 +66,14 @@ def main():
         response = session.post(TOKEN_URL, data=data)
         if response.status_code == 200:
             tokens = response.json()
-            if tokens is not None:
-                refresh_token = tokens["refresh_token"]
-                access_token = tokens["access_token"]
+            refresh_token = tokens.get("refresh_token")
+            access_token = tokens.get("access_token")
+            if refresh_token and access_token:
                 print(f"\n✅ Your tokens are:\n\n- Refresh Token: {refresh_token}\n- Access Token: {access_token}")
+            else:
+                print(f"\n❌ Token response did not contain expected fields:\n{tokens}")
         else:
-            print(f"\n❌ Error getting tokens from der API!\n{response.text}")
+            print(f"\n❌ Error getting tokens from the API!\nStatus: {response.status_code}\n{response.text}")
 
     except TimeoutException:
         print("❌ Timed out after 5 minutes. Login was not completed or the success element was not found.")
