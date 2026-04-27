@@ -1,11 +1,9 @@
 import base64
 import datetime as dt
 import getpass
-import json
 import os
 import re
 import shutil
-import time
 
 from selenium import webdriver
 from selenium.webdriver.chrome.service import Service
@@ -22,15 +20,6 @@ DEFAULT_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/125.0.0.0 Safari/537.36_CCS_APP_AOS"
-)
-
-# Mobile UA used by Maximum mode — matches the platform suggested by
-# the _CCS_APP_AOS suffix (Android), so the User-Agent is internally
-# consistent instead of a desktop browser claiming to be the mobile app.
-MOBILE_USER_AGENT = (
-    "Mozilla/5.0 (Linux; Android 14; SM-S918B) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/125.0.0.0 Mobile Safari/537.36_CCS_APP_AOS"
 )
 
 DEBUG_LOG_FILE = "kia_debug.log"
@@ -367,133 +356,6 @@ def _create_standard_driver(user_agent):
             ) from e
 
 
-def _chrome_major_version():
-    """Return the installed Chrome major version (e.g. 125), or None."""
-    try:
-        full = chromedriver_autoinstaller.get_chrome_version()
-        # Returns a string like "125.0.6422.78"
-        return int(full.split(".")[0])
-    except Exception:
-        return None
-
-
-def _create_stealth_driver(user_agent):
-    """
-    Stealth path using undetected-chromedriver. Patches the chromedriver
-    binary at runtime to drop cdc_ markers, hides navigator.webdriver,
-    and strips automation switches that the standard path can only mask.
-
-    Use this when the standard path fails with anti-bot detection
-    (e.g. Kia EU IdP "abusing request" 400).
-    """
-    try:
-        import undetected_chromedriver as uc
-    except ImportError as e:
-        raise RuntimeError(
-            "Stealth mode requires the 'undetected-chromedriver' package. "
-            "Install it with: python -m pip install undetected-chromedriver"
-        ) from e
-
-    # Build options via uc.ChromeOptions — uc handles excludeSwitches,
-    # useAutomationExtension and navigator.webdriver internally, so we
-    # only set the user agent here. --start-maximized is more reliable
-    # than driver.maximize_window() with uc on Windows.
-    options = uc.ChromeOptions()
-    options.add_argument(f"user-agent={user_agent}")
-    options.add_argument("--start-maximized")
-
-    print(
-        "[Stealth] Starting undetected Chrome — first run downloads and "
-        "patches its own ChromeDriver, this can take 10–30 seconds..."
-    )
-    try:
-        driver = uc.Chrome(
-            options=options,
-            version_main=_chrome_major_version(),
-            use_subprocess=True,
-        )
-        try:
-            driver.maximize_window()
-        except WebDriverException:
-            # Some uc + Windows combinations fail silently here; the
-            # --start-maximized flag is the real safeguard.
-            pass
-        return driver
-    except Exception as e:
-        raise RuntimeError(
-            f"Could not start Chrome in stealth mode: {e}"
-        ) from e
-
-
-def _create_maximum_driver(user_agent):
-    """
-    Maximum-stealth + diagnostic path. uc + mobile UA + Chrome
-    performance logging so the redirect chain that ends in the abuse
-    page can be reconstructed from the network log.
-    """
-    try:
-        import undetected_chromedriver as uc
-    except ImportError as e:
-        raise RuntimeError(
-            "Maximum mode requires the 'undetected-chromedriver' package. "
-            "Install it with: python -m pip install undetected-chromedriver"
-        ) from e
-
-    options = uc.ChromeOptions()
-    options.add_argument(f"user-agent={user_agent}")
-    options.add_argument("--start-maximized")
-    # Capture every network event so _dump_debug_info can replay the
-    # redirect chain after the run.
-    options.set_capability(
-        "goog:loggingPrefs", {"performance": "ALL", "browser": "ALL"}
-    )
-
-    print(
-        "[Maximum] Starting undetected Chrome with mobile UA + network "
-        "logging — first run downloads chromedriver, this can take "
-        "10–30 seconds..."
-    )
-    try:
-        driver = uc.Chrome(
-            options=options,
-            version_main=_chrome_major_version(),
-            use_subprocess=True,
-        )
-        try:
-            driver.maximize_window()
-        except WebDriverException:
-            pass
-        # Enable Network domain via CDP as a belt-and-braces alongside
-        # goog:loggingPrefs. Either source feeds the performance log.
-        try:
-            driver.execute_cdp_cmd("Network.enable", {})
-        except WebDriverException:
-            pass
-        return driver
-    except Exception as e:
-        raise RuntimeError(
-            f"Could not start Chrome in maximum mode: {e}"
-        ) from e
-
-
-def _navigate_via_click(driver, url):
-    """
-    Navigate to url by injecting an <a> tag and clicking it. The
-    resulting request carries a Referer header pointing to the current
-    page, instead of the empty Referer that driver.get() produces.
-    Some IdPs use a missing/synthetic Referer as an abuse signal.
-    """
-    script = (
-        "const a = document.createElement('a');"
-        "a.href = arguments[0];"
-        "a.rel = 'noopener';"
-        "a.style.display = 'none';"
-        "document.body.appendChild(a);"
-        "a.click();"
-    )
-    driver.execute_script(script, url)
-
-
 def _safe_truncate(value, limit=80):
     if value is None:
         return ""
@@ -501,82 +363,11 @@ def _safe_truncate(value, limit=80):
     return text if len(text) <= limit else text[:limit] + "..."
 
 
-def _dump_debug_info(driver, log_path, label):
-    """
-    Append a snapshot (URL, cookies, performance log) to log_path.
-    Best-effort: never raises, so it can be safely called from
-    finally blocks.
-    """
-    try:
-        with open(log_path, "a", encoding="utf-8") as f:
-            f.write(f"\n=== [{label}] {time.strftime('%Y-%m-%d %H:%M:%S')} ===\n")
-            try:
-                f.write(f"Current URL: {driver.current_url}\n")
-            except Exception as e:
-                f.write(f"(current_url failed: {e})\n")
-            try:
-                f.write(f"Title: {driver.title}\n")
-            except Exception as e:
-                f.write(f"(title failed: {e})\n")
-
-            f.write("\n--- Cookies ---\n")
-            try:
-                for cookie in driver.get_cookies():
-                    domain = cookie.get("domain", "?")
-                    name = cookie.get("name", "?")
-                    value = _safe_truncate(cookie.get("value"), 40)
-                    f.write(f"{domain}\t{name}={value}\n")
-            except Exception as e:
-                f.write(f"(get_cookies failed: {e})\n")
-
-            f.write("\n--- Network log (last 100 events) ---\n")
-            try:
-                logs = driver.get_log("performance")[-100:]
-                for entry in logs:
-                    try:
-                        msg = json.loads(entry["message"])["message"]
-                    except (KeyError, ValueError):
-                        continue
-                    method = msg.get("method", "")
-                    params = msg.get("params", {}) or {}
-                    if method == "Network.requestWillBeSent":
-                        req = params.get("request", {})
-                        f.write(
-                            f"REQ  {req.get('method', '')} "
-                            f"{_safe_truncate(req.get('url'), 200)}\n"
-                        )
-                    elif method == "Network.responseReceived":
-                        resp = params.get("response", {})
-                        f.write(
-                            f"RESP {resp.get('status', '')} "
-                            f"{_safe_truncate(resp.get('url'), 200)}\n"
-                        )
-                    elif method == "Network.requestWillBeSentExtraInfo":
-                        # Shows actual headers Chrome will send (incl. Referer)
-                        headers = params.get("headers", {}) or {}
-                        ref = headers.get("Referer") or headers.get("referer")
-                        if ref:
-                            f.write(f"  Referer: {_safe_truncate(ref, 200)}\n")
-            except Exception as e:
-                f.write(f"(performance log unavailable: {e})\n")
-
-            f.write("\n")
-    except Exception:
-        # Last-resort: never let debug logging break the main flow.
-        pass
-
-
-def create_driver(user_agent, mode="standard"):
+def create_driver(user_agent):
     """
     Install chromedriver and start Chrome with anti-detection flags.
-
-    mode: "standard" (default), "stealth", or "maximum".
     Raises RuntimeError if Chrome cannot be started.
     """
-    if mode == "maximum":
-        return _create_maximum_driver(user_agent)
-    if mode == "stealth":
-        return _create_stealth_driver(user_agent)
     return _create_standard_driver(user_agent)
 
 
@@ -745,7 +536,7 @@ def kia_eu_direct_probe(email, password, log_path):
     """
     _direct_log(
         log_path,
-        f"\n=== Kia EU Direct API Probe — {time.strftime('%Y-%m-%d %H:%M:%S')} ===",
+        f"\n=== Kia EU Direct API Probe — {dt.datetime.now():%Y-%m-%d %H:%M:%S} ===",
     )
     _direct_log(log_path, f"Email: {email}")
 
@@ -898,142 +689,52 @@ def kia_eu_direct_probe(email, password, log_path):
     return None
 
 
-def select_mode():
-    """
-    Ask the user which login flow to use.
-
-    Standard: vanilla Selenium with anti-detection flags + CDP overrides.
-    Stealth:  undetected-chromedriver, which patches the chromedriver
-              binary at runtime. Try this if Standard hits Kia's
-              "abusing request" 400 or similar bot-detection blocks.
-    Maximum:  Stealth + mobile UA + JS-click navigation (sets Referer)
-              + network logging written to kia_debug.log. Use as a
-              last resort and to gather diagnostic data.
-    Direct:   No browser. Probes several non-browser API endpoints
-              (ROPC token-grant, legacy signin form, CCSP authorize)
-              with proper app headers. Kia EU only.
-    """
-    print("Select login mode:\n")
-    print("  1) Standard   (default — try this first)")
-    print("  2) Stealth    (undetected-chromedriver — try if Standard fails)")
-    print("  3) Maximum    (Stealth + mobile UA + click-nav + debug log)")
-    print("  4) Direct     (no browser, direct API probes — Kia EU only)")
-    print()
-    while True:
-        choice = input("Enter mode (1-4) [1]: ").strip() or "1"
-        if choice in ("1", "2", "3", "4"):
-            break
-        print("Invalid choice.")
-
-    mode = {"1": "standard", "2": "stealth", "3": "maximum", "4": "direct"}[choice]
-    print(f"\n-> {mode.capitalize()} mode selected.\n")
-    if mode == "stealth":
-        print("=" * 60)
-        print("NOTE: Stealth mode uses undetected-chromedriver. It will")
-        print("download its own ChromeDriver on first run and may take a")
-        print("few extra seconds to start. If it fails to launch, fall")
-        print("back to Standard mode.")
-        print("=" * 60 + "\n")
-    elif mode == "maximum":
-        print("=" * 60)
-        print("NOTE: Maximum mode bundles every bypass technique we have")
-        print("(undetected-chromedriver + Android mobile User-Agent +")
-        print("JS-click navigation that sends a real Referer header) and")
-        print("writes a detailed network log to:")
-        print(f"  {os.path.abspath(DEBUG_LOG_FILE)}")
-        print("If this still fails, send the contents of that log so we")
-        print("can see exactly which request triggers the abuse page.")
-        print("=" * 60 + "\n")
-    elif mode == "direct":
-        print("=" * 60)
-        print("NOTE: Direct mode skips the browser entirely and talks to")
-        print("Kia's CCSP backend / IdP token endpoint with the same")
-        print("headers the Android app sends (Stamp, ccsp-service-id,")
-        print("etc.). It probes several historical endpoints that may")
-        print("or may not still be alive. Every request is logged to:")
-        print(f"  {os.path.abspath(DEBUG_LOG_FILE)}")
-        print("This mode is experimental — the most recent maintainers")
-        print("of hyundai_kia_connect_api report direct password login")
-        print("is dead due to reCAPTCHA on the IdP form. We're testing")
-        print("anyway because the token endpoint itself is not WAF-")
-        print("protected and may accept ROPC.")
-        print("=" * 60 + "\n")
-    return mode
-
-
-def _run_direct_mode(region, brand):
-    """Mode 4 entry point: prompt for credentials and run the probes."""
-    if region["name"] != "Europe" or brand["name"] != "Kia":
-        print(
-            "[ERROR] Direct mode is only implemented for Europe / Kia. "
-            "Other regions/brands need their own constants and probe "
-            "logic. Aborting."
-        )
-        return
-
+def _run_kia_eu_direct(region, brand):
+    """Browserless direct-API path for Kia EU. Prompts for credentials."""
     debug_log_path = os.path.abspath(DEBUG_LOG_FILE)
     try:
         with open(debug_log_path, "w", encoding="utf-8") as f:
             f.write(
                 f"Kia EU direct-API debug log — "
-                f"{time.strftime('%Y-%m-%d %H:%M:%S')}\n"
+                f"{dt.datetime.now():%Y-%m-%d %H:%M:%S}\n"
             )
     except OSError:
         pass
 
-    print("Direct mode requires your Kia account credentials. They are sent")
-    print("only to Kia's own endpoints (idpconnect-eu.kia.com, prd.eu-ccapi.")
-    print("kia.com) — never logged to disk in plaintext, never to a third")
-    print("party. The password prompt below is hidden as you type.\n")
+    print(f"Logging into {brand['name']} ({region['name']}) — no browser needed.\n")
+    print("Your credentials are sent only to Kia's own endpoints")
+    print("(idpconnect-eu.kia.com, prd.eu-ccapi.kia.com), never to a third")
+    print("party, never written to disk in plaintext. The password prompt")
+    print("below is hidden as you type.\n")
     email = input("Email:    ").strip()
     password = getpass.getpass("Password: ")
     if not email or not password:
         print("[ERROR] Email or password is empty. Aborting.")
         return
 
-    print("\nProbing endpoints — this typically takes 5–15 seconds...\n")
+    print("\nFetching token (typically 5–15 seconds)...\n")
     tokens = kia_eu_direct_probe(email, password, debug_log_path)
     if tokens and tokens.get("refresh_token") and tokens.get("access_token"):
         print(
-            f"\n[OK] Direct mode succeeded! Your tokens are:\n\n"
+            f"[OK] Your tokens are:\n\n"
             f"- Refresh Token: {tokens['refresh_token']}\n"
             f"- Access Token:  {tokens['access_token']}"
         )
     else:
-        print("[ERROR] No probe returned valid tokens.")
-        print(f"See {debug_log_path} for the full response of every probe —")
-        print("the status codes will tell us which endpoints are alive and")
-        print("which are WAF-blocked, so we know what to try next.")
+        print("[ERROR] Could not obtain tokens. Possible reasons:")
+        print("  - Wrong email or password (most likely)")
+        print("  - Kia changed an endpoint (rare — please open an issue)")
+        print(f"\nThe full diagnostic log is at:\n  {debug_log_path}")
+        print("Open an issue with the log contents (passwords are NOT logged).")
 
 
-def main():
-    region, brand = select_region_and_brand()
-    mode = select_mode()
-
-    if mode == "direct":
-        _run_direct_mode(region, brand)
-        return
-
-    # Use the brand's normal UA for Step 1 (login). In Maximum mode we
-    # switch to MOBILE_USER_AGENT via CDP just before Step 2, so the
-    # login page (which depends on the desktop UA for the
-    # success_selector to appear) keeps working.
+def _run_browser_flow(region, brand):
+    """Browser-based OAuth flow for non-Kia-EU regions."""
     user_agent = brand.get("user_agent", DEFAULT_USER_AGENT)
-
-    debug_log_path = os.path.abspath(DEBUG_LOG_FILE)
-    if mode == "maximum":
-        # Reset the log for this run so it only contains current data.
-        try:
-            with open(debug_log_path, "w", encoding="utf-8") as f:
-                f.write(f"Kia debug log — {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
-                f.write(f"Region: {region['name']}, Brand: {brand['name']}\n")
-                f.write(f"User-Agent: {user_agent}\n")
-        except OSError:
-            pass
 
     driver = None
     try:
-        driver = create_driver(user_agent, mode=mode)
+        driver = create_driver(user_agent)
 
         print(f"Opening {brand['name']} ({region['name']}) login page...")
         driver.get(brand["login_url"])
@@ -1075,46 +776,20 @@ def main():
         if brand.get("redirect_url"):
             # EU-style: navigate to a separate authorize URL to trigger
             # the OAuth redirect that carries the authorization code.
-            # Pause before the handoff: Kia's EU IdP flags fast back-to-back
-            # authorize calls as "abusing requests".
-            if mode == "maximum":
-                # Switch UA to a real Android UA only for Step 2. The
-                # IdP's CCSP authorize endpoint is the one that flags
-                # "abuse"; making this single request look like the
-                # mobile app is the actual experiment.
-                try:
-                    driver.execute_cdp_cmd(
-                        "Network.setUserAgentOverride",
-                        {"userAgent": MOBILE_USER_AGENT},
-                    )
-                except WebDriverException:
-                    pass
-                _dump_debug_info(driver, debug_log_path, "before-step-2")
-            time.sleep(5)
+            driver.get(brand["redirect_url"])
             try:
-                if mode == "maximum":
-                    # Click-style navigation sends a real Referer header
-                    # from the marketing site, which driver.get() omits.
-                    _navigate_via_click(driver, brand["redirect_url"])
-                else:
-                    driver.get(brand["redirect_url"])
-                try:
-                    wait = WebDriverWait(driver, 20)
-                    wait.until(
-                        lambda d: "code=" in d.current_url or "error=" in d.current_url
-                    )
-                except TimeoutException:
-                    raise Exception(
-                        "Timed out waiting for OAuth redirect. "
-                        "The authorization server did not return a code."
-                    )
-            finally:
-                if mode == "maximum":
-                    _dump_debug_info(driver, debug_log_path, "after-step-2")
+                wait = WebDriverWait(driver, 20)
+                wait.until(
+                    lambda d: "code=" in d.current_url or "error=" in d.current_url
+                )
+            except TimeoutException:
+                raise Exception(
+                    "Timed out waiting for OAuth redirect. "
+                    "The authorization server did not return a code."
+                )
         elif "code=" not in driver.current_url:
             # Standard: the login page already redirected (or will
             # redirect) to redirect_url_final?code=...
-            # Give it a generous timeout in case the redirect is slow.
             try:
                 wait = WebDriverWait(driver, 60)
                 wait.until(
@@ -1181,6 +856,19 @@ def main():
                 driver.quit()
             except Exception:
                 pass
+
+
+def main():
+    region, brand = select_region_and_brand()
+
+    # Kia EU is fully browserless via direct-API login. Every other
+    # region/brand still uses the OAuth-via-browser flow because (a)
+    # they don't sit behind AWS WAF Bot Control and (b) we don't have
+    # validated app constants (Service ID, App ID, CFB key) for them.
+    if region["name"] == "Europe" and brand["name"] == "Kia":
+        _run_kia_eu_direct(region, brand)
+    else:
+        _run_browser_flow(region, brand)
 
 
 if __name__ == "__main__":

@@ -1,5 +1,44 @@
 # Changelog
 
+## [3.0.0] - 2026-04-27
+
+### Added
+- **Browserless direct-API login for Kia EU.** Kia put their EU IdP
+  behind AWS WAF Bot Control in late 2025, which blocks every
+  browser-based OAuth flow regardless of stealth tricks (Selenium,
+  undetected-chromedriver, real Chrome on the user's own machine —
+  all blocked with `error=Bad+Request, classified as abusing
+  request`). Kia EU users are now routed to a direct-API path that
+  POSTs credentials to `/auth/account/signin` with the CCSP
+  client_id, retrieves a code, and exchanges it at the token
+  endpoint. End-to-end ~10 seconds, no browser, no WAF interaction.
+  Constants (`CCSP_SERVICE_ID`, `APP_ID`, CFB key for the Stamp
+  HMAC) sourced from `hyundai_kia_connect_api`.
+- Diagnostic log written to `kia_debug.log` for the direct-API path
+  so endpoint changes can be debugged from the request/response
+  trace (passwords are never logged).
+
+### Changed
+- **Routing is now automatic per region/brand.** No more "select
+  mode" prompt — Kia EU goes through direct-API, every other
+  region/brand goes through the browser flow.
+
+### Removed
+- **Mode selection prompt** (Standard / Stealth / Maximum / Direct
+  from v2.x). With Direct working for Kia EU and the others not
+  helping against WAF, the choice was unnecessary cognitive load.
+- **`undetected-chromedriver` dependency**. Used to power the
+  Stealth/Maximum browser modes that we now know cannot beat AWS
+  WAF Bot Control regardless of stealth depth.
+- All Stealth-mode and Maximum-mode browser code paths
+  (`_create_stealth_driver`, `_create_maximum_driver`,
+  `_navigate_via_click`, `_dump_debug_info`, mobile-UA override).
+
+### Fixed
+- The Kia EU "OAuth error … abusing request blocked" failure that
+  affected every user of v2.x is the entire reason this version
+  exists. v3 routes around it instead of trying to fight WAF.
+
 ## [2.1.0] - 2026-03-21
 
 ### Added
