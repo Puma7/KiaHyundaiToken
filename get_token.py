@@ -1,3 +1,4 @@
+import json
 import os
 import re
 import shutil
@@ -19,6 +20,17 @@ DEFAULT_USER_AGENT = (
     "AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/125.0.0.0 Safari/537.36_CCS_APP_AOS"
 )
+
+# Mobile UA used by Maximum mode — matches the platform suggested by
+# the _CCS_APP_AOS suffix (Android), so the User-Agent is internally
+# consistent instead of a desktop browser claiming to be the mobile app.
+MOBILE_USER_AGENT = (
+    "Mozilla/5.0 (Linux; Android 14; SM-S918B) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/125.0.0.0 Mobile Safari/537.36_CCS_APP_AOS"
+)
+
+DEBUG_LOG_FILE = "kia_debug.log"
 
 # ---------------------------------------------------------------------------
 # Region and brand configurations
@@ -410,13 +422,156 @@ def _create_stealth_driver(user_agent):
         ) from e
 
 
+def _create_maximum_driver(user_agent):
+    """
+    Maximum-stealth + diagnostic path. uc + mobile UA + Chrome
+    performance logging so the redirect chain that ends in the abuse
+    page can be reconstructed from the network log.
+    """
+    try:
+        import undetected_chromedriver as uc
+    except ImportError as e:
+        raise RuntimeError(
+            "Maximum mode requires the 'undetected-chromedriver' package. "
+            "Install it with: python -m pip install undetected-chromedriver"
+        ) from e
+
+    options = uc.ChromeOptions()
+    options.add_argument(f"user-agent={user_agent}")
+    options.add_argument("--start-maximized")
+    # Capture every network event so _dump_debug_info can replay the
+    # redirect chain after the run.
+    options.set_capability(
+        "goog:loggingPrefs", {"performance": "ALL", "browser": "ALL"}
+    )
+
+    print(
+        "[Maximum] Starting undetected Chrome with mobile UA + network "
+        "logging — first run downloads chromedriver, this can take "
+        "10–30 seconds..."
+    )
+    try:
+        driver = uc.Chrome(
+            options=options,
+            version_main=_chrome_major_version(),
+            use_subprocess=True,
+        )
+        try:
+            driver.maximize_window()
+        except WebDriverException:
+            pass
+        # Enable Network domain via CDP as a belt-and-braces alongside
+        # goog:loggingPrefs. Either source feeds the performance log.
+        try:
+            driver.execute_cdp_cmd("Network.enable", {})
+        except WebDriverException:
+            pass
+        return driver
+    except Exception as e:
+        raise RuntimeError(
+            f"Could not start Chrome in maximum mode: {e}"
+        ) from e
+
+
+def _navigate_via_click(driver, url):
+    """
+    Navigate to url by injecting an <a> tag and clicking it. The
+    resulting request carries a Referer header pointing to the current
+    page, instead of the empty Referer that driver.get() produces.
+    Some IdPs use a missing/synthetic Referer as an abuse signal.
+    """
+    script = (
+        "const a = document.createElement('a');"
+        "a.href = arguments[0];"
+        "a.rel = 'noopener';"
+        "a.style.display = 'none';"
+        "document.body.appendChild(a);"
+        "a.click();"
+    )
+    driver.execute_script(script, url)
+
+
+def _safe_truncate(value, limit=80):
+    if value is None:
+        return ""
+    text = str(value)
+    return text if len(text) <= limit else text[:limit] + "..."
+
+
+def _dump_debug_info(driver, log_path, label):
+    """
+    Append a snapshot (URL, cookies, performance log) to log_path.
+    Best-effort: never raises, so it can be safely called from
+    finally blocks.
+    """
+    try:
+        with open(log_path, "a", encoding="utf-8") as f:
+            f.write(f"\n=== [{label}] {time.strftime('%Y-%m-%d %H:%M:%S')} ===\n")
+            try:
+                f.write(f"Current URL: {driver.current_url}\n")
+            except Exception as e:
+                f.write(f"(current_url failed: {e})\n")
+            try:
+                f.write(f"Title: {driver.title}\n")
+            except Exception as e:
+                f.write(f"(title failed: {e})\n")
+
+            f.write("\n--- Cookies ---\n")
+            try:
+                for cookie in driver.get_cookies():
+                    domain = cookie.get("domain", "?")
+                    name = cookie.get("name", "?")
+                    value = _safe_truncate(cookie.get("value"), 40)
+                    f.write(f"{domain}\t{name}={value}\n")
+            except Exception as e:
+                f.write(f"(get_cookies failed: {e})\n")
+
+            f.write("\n--- Network log (last 100 events) ---\n")
+            try:
+                logs = driver.get_log("performance")[-100:]
+                for entry in logs:
+                    try:
+                        msg = json.loads(entry["message"])["message"]
+                    except (KeyError, ValueError):
+                        continue
+                    method = msg.get("method", "")
+                    params = msg.get("params", {}) or {}
+                    if method == "Network.requestWillBeSent":
+                        req = params.get("request", {})
+                        f.write(
+                            f"REQ  {req.get('method', '')} "
+                            f"{_safe_truncate(req.get('url'), 200)}\n"
+                        )
+                    elif method == "Network.responseReceived":
+                        resp = params.get("response", {})
+                        f.write(
+                            f"RESP {resp.get('status', '')} "
+                            f"{_safe_truncate(resp.get('url'), 200)}\n"
+                        )
+                    elif method == "Network.requestWillBeSentExtraInfo":
+                        # Shows actual headers Chrome will send (incl. Referer)
+                        headers = params.get("headers", {}) or {}
+                        ref = headers.get("Referer") or headers.get("referer")
+                        if ref:
+                            f.write(f"  Referer: {_safe_truncate(ref, 200)}\n")
+            except Exception as e:
+                f.write(f"(performance log unavailable: {e})\n")
+
+            f.write("\n")
+    except Exception:
+        # Last-resort: never let debug logging break the main flow.
+        pass
+
+
 def create_driver(user_agent, mode="standard"):
     """
     Install chromedriver and start Chrome with anti-detection flags.
 
-    mode: "standard" (default) or "stealth".
+    mode: "standard" (default), "stealth", or "maximum".
     Raises RuntimeError if Chrome cannot be started.
     """
+    if mode == "maximum":
+        return _create_maximum_driver(user_agent)
     if mode == "stealth":
         return _create_stealth_driver(user_agent)
     return _create_standard_driver(user_agent)
@@ -482,18 +637,22 @@ def select_mode():
     Stealth:  undetected-chromedriver, which patches the chromedriver
               binary at runtime. Try this if Standard hits Kia's
               "abusing request" 400 or similar bot-detection blocks.
+    Maximum:  Stealth + mobile UA + JS-click navigation (sets Referer)
+              + network logging written to kia_debug.log. Use as a
+              last resort and to gather diagnostic data.
     """
     print("Select login mode:\n")
     print("  1) Standard   (default — try this first)")
     print("  2) Stealth    (undetected-chromedriver — try if Standard fails)")
+    print("  3) Maximum    (Stealth + mobile UA + click-nav + debug log)")
     print()
     while True:
-        choice = input("Enter mode (1-2) [1]: ").strip() or "1"
-        if choice in ("1", "2"):
+        choice = input("Enter mode (1-3) [1]: ").strip() or "1"
+        if choice in ("1", "2", "3"):
             break
         print("Invalid choice.")
 
-    mode = "stealth" if choice == "2" else "standard"
+    mode = {"1": "standard", "2": "stealth", "3": "maximum"}[choice]
     print(f"\n-> {mode.capitalize()} mode selected.\n")
     if mode == "stealth":
         print("=" * 60)
@@ -502,6 +661,16 @@ def select_mode():
         print("few extra seconds to start. If it fails to launch, fall")
         print("back to Standard mode.")
         print("=" * 60 + "\n")
+    elif mode == "maximum":
+        print("=" * 60)
+        print("NOTE: Maximum mode bundles every bypass technique we have")
+        print("(undetected-chromedriver + Android mobile User-Agent +")
+        print("JS-click navigation that sends a real Referer header) and")
+        print("writes a detailed network log to:")
+        print(f"  {os.path.abspath(DEBUG_LOG_FILE)}")
+        print("If this still fails, send the contents of that log so we")
+        print("can see exactly which request triggers the abuse page.")
+        print("=" * 60 + "\n")
     return mode
 
 
@@ -509,7 +678,22 @@ def main():
     region, brand = select_region_and_brand()
     mode = select_mode()
 
+    # Use the brand's normal UA for Step 1 (login). In Maximum mode we
+    # switch to MOBILE_USER_AGENT via CDP just before Step 2, so the
+    # login page (which depends on the desktop UA for the
+    # success_selector to appear) keeps working.
     user_agent = brand.get("user_agent", DEFAULT_USER_AGENT)
+
+    debug_log_path = os.path.abspath(DEBUG_LOG_FILE)
+    if mode == "maximum":
+        # Reset the log for this run so it only contains current data.
+        try:
+            with open(debug_log_path, "w", encoding="utf-8") as f:
+                f.write(f"Kia debug log — {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+                f.write(f"Region: {region['name']}, Brand: {brand['name']}\n")
+                f.write(f"User-Agent: {user_agent}\n")
+        except OSError:
+            pass
 
     driver = None
     try:
@@ -557,18 +741,40 @@ def main():
             # the OAuth redirect that carries the authorization code.
             # Pause before the handoff: Kia's EU IdP flags fast back-to-back
             # authorize calls as "abusing requests".
+            if mode == "maximum":
+                # Switch UA to a real Android UA only for Step 2. The
+                # IdP's CCSP authorize endpoint is the one that flags
+                # "abuse"; making this single request look like the
+                # mobile app is the actual experiment.
+                try:
+                    driver.execute_cdp_cmd(
+                        "Network.setUserAgentOverride",
+                        {"userAgent": MOBILE_USER_AGENT},
+                    )
+                except WebDriverException:
+                    pass
+                _dump_debug_info(driver, debug_log_path, "before-step-2")
             time.sleep(5)
-            driver.get(brand["redirect_url"])
             try:
-                wait = WebDriverWait(driver, 20)
-                wait.until(
-                    lambda d: "code=" in d.current_url or "error=" in d.current_url
-                )
-            except TimeoutException:
-                raise Exception(
-                    "Timed out waiting for OAuth redirect. "
-                    "The authorization server did not return a code."
-                )
+                if mode == "maximum":
+                    # Click-style navigation sends a real Referer header
+                    # from the marketing site, which driver.get() omits.
+                    _navigate_via_click(driver, brand["redirect_url"])
+                else:
+                    driver.get(brand["redirect_url"])
+                try:
+                    wait = WebDriverWait(driver, 20)
+                    wait.until(
+                        lambda d: "code=" in d.current_url or "error=" in d.current_url
+                    )
+                except TimeoutException:
+                    raise Exception(
+                        "Timed out waiting for OAuth redirect. "
+                        "The authorization server did not return a code."
+                    )
+            finally:
+                if mode == "maximum":
+                    _dump_debug_info(driver, debug_log_path, "after-step-2")
         elif "code=" not in driver.current_url:
             # Standard: the login page already redirected (or will
             # redirect) to redirect_url_final?code=...
