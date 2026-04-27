@@ -10,7 +10,7 @@ Get your **Kia** or **Hyundai** OAuth2 refresh token — worldwide.
 | Europe | Hyundai | One-time browser login (Kia's EU IdP-redirect flow). Experimental. |
 | China, Australia, New Zealand, India, Brazil | Kia and/or Hyundai | One-time browser login. Untested — community validation needed. |
 
-Why two methods? In late 2025 Kia put their EU IdP behind **AWS WAF Bot Control**, which blocks every browser-based OAuth flow regardless of stealth tricks. We worked around it by talking to Kia's CCSP backend directly with the same headers their official Android app sends — so for Kia EU users, the script no longer opens a browser at all. For other regions the browser flow still works because they aren't behind WAF Bot Control.
+Why two methods? In late 2025 Kia added stricter anti-bot protection on their EU login servers, which interferes with browser-based OAuth flows. For Kia EU users the script uses a non-browser path that talks to Kia's API directly with the same headers their official mobile app sends — so no Chrome window opens at all. Other regions still use the browser flow because they don't need the alternate path.
 
 > **USA / Canada:** These regions use a different authentication method (direct API login, no browser required). Most integrations (e.g. Home Assistant) handle authentication directly for these regions — you typically do not need this tool.
 
@@ -160,8 +160,8 @@ If you are from a region marked "untested", you can help:
 2. **Report.** Open a GitHub issue with your region/brand, whether the login page loaded, whether tokens were returned, and any error messages.
 3. **CSS selectors.** If the login page works but the script does not detect login automatically (you had to press Enter), inspect the page after login and report a CSS selector that uniquely identifies a post-login element.
 
-If you have a Kia account in a region other than EU and the script's browser flow keeps failing with an "abuse" / WAF error similar to what Kia EU saw, we may need to apply the same direct-API workaround for your region. That requires the brand-specific app constants (Service ID, App ID, CFB key for the Stamp HMAC) — these are in the `hyundai_kia_connect_api` library. Open an issue with your region and we'll wire it up.
+If you have a Kia or Hyundai account in a region where the script's browser flow keeps failing with login errors that look similar to what Kia EU users see, your region may also need a non-browser path. Open an issue with your region and the error message — the brand-specific constants we'd need are documented in the `hyundai_kia_connect_api` library, and we can wire them up.
 
 ## Credits
 
-The Kia EU direct-API workaround uses constants and the Stamp algorithm sourced from the open-source [`hyundai_kia_connect_api`](https://github.com/Hyundai-Kia-Connect/hyundai_kia_connect_api) library. The breakthrough — POSTing credentials to `/auth/account/signin` with `client_id=fdc85c00...` to get a code that the CCSP token endpoint accepts — was discovered while working around AWS WAF Bot Control on `idpconnect-eu.kia.com/auth/api/v2/*`. Sharing this back is the open-source way.
+The Kia EU non-browser path reuses constants and the request-signing algorithm from the open-source [`hyundai_kia_connect_api`](https://github.com/Hyundai-Kia-Connect/hyundai_kia_connect_api) library. Thanks to that community for the groundwork — without it this tool would not exist.
