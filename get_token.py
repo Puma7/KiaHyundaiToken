@@ -695,6 +695,42 @@ def _exchange_code_for_tokens(session_obj, code, log_path):
     return None
 
 
+def _form_signin(session_obj, client_id, redirect_uri, email, password, log_path, label):
+    """
+    POST credentials to /auth/account/signin (NOT WAF-blocked). Returns
+    the authorization code from the redirect Location, or None.
+    """
+    url = "https://idpconnect-eu.kia.com/auth/account/signin"
+    data = {
+        "client_id": client_id,
+        "encryptedPassword": "false",
+        "username": email,
+        "password": password,
+        "redirect_uri": redirect_uri,
+        "state": "ccsp",
+        "remember_me": "false",
+    }
+    headers = {
+        "User-Agent": DEFAULT_USER_AGENT,
+        "Content-Type": "application/x-www-form-urlencoded",
+        "Origin": "https://idpconnect-eu.kia.com",
+        "Referer": "https://idpconnect-eu.kia.com/",
+    }
+    try:
+        resp = session_obj.post(
+            url, data=data, headers=headers, timeout=30, allow_redirects=False
+        )
+        _log_response(log_path, label, resp)
+        if resp.status_code in (302, 303):
+            location = resp.headers.get("Location", "")
+            match = re.search(r"[?&]code=([^&]+)", location)
+            if match:
+                return match.group(1)
+    except Exception as e:
+        _direct_log(log_path, f"  [{label}] exception: {e}")
+    return None
+
+
 def kia_eu_direct_probe(email, password, log_path):
     """
     Try several non-browser approaches to obtain a Kia EU refresh_token.
@@ -748,46 +784,57 @@ def kia_eu_direct_probe(email, password, log_path):
         _direct_log(log_path, f"  [Probe 1] exception: {e}")
 
     # ----------------------------------------------------------------
-    # Probe 2: Legacy form-based signin against /auth/account/signin.
-    # This is the URL the marketing-site browser flow ultimately POSTs
-    # to behind the scenes after reCAPTCHA. If WAF only protects the
-    # /auth/api/v2/* paths and not /auth/account/*, this might still
-    # accept credentials directly.
+    # Probe 2a: Form-based signin using the CCSP client_id directly.
+    # Earlier diagnostic showed signin works, but a code issued for the
+    # marketing client cannot be exchanged at the CCSP token endpoint
+    # (OAuth requires redirect_uri at authorize and exchange to match).
+    # Asking signin to issue a code FOR the CCSP client + CCSP
+    # redirect_uri lets the regular exchange work end-to-end.
     # ----------------------------------------------------------------
-    _direct_log(log_path, "\n--- Probe 2: IdP form signin /auth/account/signin ---")
-    try:
-        url = "https://idpconnect-eu.kia.com/auth/account/signin"
-        data = {
-            "client_id": "peukiaidm-online-sales",
-            "encryptedPassword": "false",
-            "username": email,
-            "password": password,
-            "redirect_uri": "https://www.kia.com/api/bin/oneid/login",
-            "state": "ccsp",
-            "remember_me": "false",
-        }
-        headers = {
-            "User-Agent": DEFAULT_USER_AGENT,
-            "Content-Type": "application/x-www-form-urlencoded",
-            "Origin": "https://idpconnect-eu.kia.com",
-            "Referer": "https://idpconnect-eu.kia.com/",
-        }
-        resp = s.post(url, data=data, headers=headers, timeout=30, allow_redirects=False)
-        _log_response(log_path, "Probe 2", resp)
-        # If credentials are accepted, the IdP redirects with code= or
-        # to the marketing site. Either way, a 302 with Location is
-        # the success indicator.
-        if resp.status_code in (302, 303):
-            location = resp.headers.get("Location", "")
-            match = re.search(r"[?&]code=([^&]+)", location)
-            if match:
-                code = match.group(1)
-                _direct_log(log_path, f"  [Probe 2] Got code, exchanging…")
-                tokens = _exchange_code_for_tokens(s, code, log_path)
-                if tokens and tokens.get("refresh_token"):
-                    return tokens
-    except Exception as e:
-        _direct_log(log_path, f"  [Probe 2] exception: {e}")
+    _direct_log(
+        log_path,
+        "\n--- Probe 2a: signin with CCSP client_id (the killer attempt) ---",
+    )
+    code = _form_signin(
+        s,
+        KIA_EU_CCSP_SERVICE_ID,
+        "https://prd.eu-ccapi.kia.com:8080/api/v1/user/oauth2/redirect",
+        email,
+        password,
+        log_path,
+        "Probe 2a",
+    )
+    if code:
+        _direct_log(log_path, f"  [Probe 2a] Got code for CCSP client, exchanging…")
+        tokens = _exchange_code_for_tokens(s, code, log_path)
+        if tokens and tokens.get("refresh_token") and tokens.get("access_token"):
+            _direct_log(log_path, "  [JACKPOT] Probe 2a returned tokens.")
+            return tokens
+
+    # ----------------------------------------------------------------
+    # Probe 2b: Marketing-client signin (control case). We already know
+    # this returns a code. Useful only as a sanity check that the
+    # signin endpoint is alive in this session — without the marketing
+    # client_secret we can't exchange the code for tokens.
+    # ----------------------------------------------------------------
+    _direct_log(
+        log_path,
+        "\n--- Probe 2b: signin with marketing client_id (control, no exchange) ---",
+    )
+    code = _form_signin(
+        s,
+        "peukiaidm-online-sales",
+        "https://www.kia.com/api/bin/oneid/login",
+        email,
+        password,
+        log_path,
+        "Probe 2b",
+    )
+    if code:
+        _direct_log(
+            log_path,
+            f"  [Probe 2b] Got marketing code (cannot exchange — no marketing secret).",
+        )
 
     # ----------------------------------------------------------------
     # Probe 3: CCSP authorize endpoint on port 8080. Different host
