@@ -1,6 +1,7 @@
 import os
 import re
 import shutil
+import time
 
 from selenium import webdriver
 from selenium.webdriver.chrome.service import Service
@@ -271,7 +272,28 @@ def _build_chrome_options(user_agent):
     chrome_options = webdriver.ChromeOptions()
     chrome_options.add_argument(f"user-agent={user_agent}")
     chrome_options.add_argument("--disable-blink-features=AutomationControlled")
+    # Kia EU's IdP fingerprints these Selenium markers and classifies the
+    # CCSP authorize request as an "abusing request". Hide them.
+    chrome_options.add_experimental_option("excludeSwitches", ["enable-automation"])
+    chrome_options.add_experimental_option("useAutomationExtension", False)
     return chrome_options
+
+
+def _apply_stealth(driver):
+    """Hide remaining Selenium markers via CDP overrides."""
+    try:
+        driver.execute_cdp_cmd(
+            "Page.addScriptToEvaluateOnNewDocument",
+            {
+                "source": (
+                    "Object.defineProperty(navigator, 'webdriver', "
+                    "{get: () => undefined});"
+                )
+            },
+        )
+    except WebDriverException:
+        # CDP is best-effort; not fatal if the driver doesn't support it.
+        pass
 
 
 def install_chromedriver():
@@ -311,6 +333,7 @@ def create_driver(user_agent):
         service = Service(driver_path)
         driver = webdriver.Chrome(service=service, options=_build_chrome_options(user_agent))
         driver.maximize_window()
+        _apply_stealth(driver)
         return driver
     except WebDriverException:
         # Clean up broken install and retry once — only if path is safe
@@ -325,6 +348,7 @@ def create_driver(user_agent):
             service = Service(driver_path)
             driver = webdriver.Chrome(service=service, options=_build_chrome_options(user_agent))
             driver.maximize_window()
+            _apply_stealth(driver)
             return driver
         except Exception as e:
             raise RuntimeError(
@@ -433,6 +457,9 @@ def main():
         if brand.get("redirect_url"):
             # EU-style: navigate to a separate authorize URL to trigger
             # the OAuth redirect that carries the authorization code.
+            # Pause before the handoff: Kia's EU IdP flags fast back-to-back
+            # authorize calls as "abusing requests".
+            time.sleep(5)
             driver.get(brand["redirect_url"])
             try:
                 wait = WebDriverWait(driver, 20)
