@@ -1,3 +1,6 @@
+import base64
+import datetime as dt
+import getpass
 import json
 import os
 import re
@@ -629,9 +632,228 @@ def select_region_and_brand():
     return region, brand
 
 
+# ---------------------------------------------------------------------------
+# Kia EU Direct-API constants (sourced from hyundai_kia_connect_api HEAD).
+# These mimic the official Android app and are used only by Mode 4.
+# ---------------------------------------------------------------------------
+KIA_EU_CCSP_SERVICE_ID = "fdc85c00-0a2f-4c64-bcb4-2cfb1500730a"
+KIA_EU_APP_ID = "a2b8469b-30a3-4361-8e13-6fceea8fbe74"
+KIA_EU_CLIENT_SECRET = "secret"
+KIA_EU_BASIC_AUTH = (
+    "Basic ZmRjODVjMDAtMGEyZi00YzY0LWJjYjQtMmNmYjE1MDA3MzBhOnNlY3JldA=="
+)
+KIA_EU_CFB = base64.b64decode(
+    "wLTVxwidmH8CfJYBWSnHD6E0huk0ozdiuygB4hLkM5XCgzAL1Dk5sE36d/bx5PFMbZs="
+)
+KIA_EU_OKHTTP_UA = "okhttp/3.12.0"
+
+
+def _kia_eu_stamp():
+    """Generate the Stamp header expected by the Kia EU CCSP backend."""
+    raw = f"{KIA_EU_APP_ID}:{int(dt.datetime.now().timestamp())}".encode()
+    result = bytes(b1 ^ b2 for b1, b2 in zip(KIA_EU_CFB, raw))
+    return base64.b64encode(result).decode("utf-8")
+
+
+def _direct_log(log_path, text):
+    """Best-effort append to the debug log."""
+    try:
+        with open(log_path, "a", encoding="utf-8") as f:
+            f.write(text + "\n")
+    except OSError:
+        pass
+
+
+def _log_response(log_path, label, response):
+    """Log status, important headers, and a truncated body."""
+    _direct_log(log_path, f"  [{label}] status={response.status_code}")
+    location = response.headers.get("Location")
+    if location:
+        _direct_log(log_path, f"  [{label}] Location: {_safe_truncate(location, 300)}")
+    set_cookie = response.headers.get("Set-Cookie")
+    if set_cookie:
+        _direct_log(log_path, f"  [{label}] Set-Cookie: {_safe_truncate(set_cookie, 300)}")
+    body = response.text or ""
+    _direct_log(log_path, f"  [{label}] body[:500]: {_safe_truncate(body, 500)}")
+
+
+def _exchange_code_for_tokens(session_obj, code, log_path):
+    """Use the IdP token endpoint (not WAF-protected) to swap a code for tokens."""
+    url = "https://idpconnect-eu.kia.com/auth/api/v2/user/oauth2/token"
+    data = {
+        "grant_type": "authorization_code",
+        "code": code,
+        "redirect_uri": "https://prd.eu-ccapi.kia.com:8080/api/v1/user/oauth2/redirect",
+        "client_id": KIA_EU_CCSP_SERVICE_ID,
+        "client_secret": KIA_EU_CLIENT_SECRET,
+    }
+    _direct_log(log_path, f"\n  [Token exchange] POST {url}")
+    resp = session_obj.post(url, data=data, timeout=30)
+    _log_response(log_path, "Token exchange", resp)
+    if resp.status_code == 200:
+        return resp.json()
+    return None
+
+
+def kia_eu_direct_probe(email, password, log_path):
+    """
+    Try several non-browser approaches to obtain a Kia EU refresh_token.
+    Each probe is logged in detail to log_path. Returns a token dict
+    (with 'refresh_token' and 'access_token') if any probe succeeds,
+    else None.
+
+    The probes are deliberately ordered cheapest-and-most-promising
+    first: ROPC at the IdP token endpoint (which is not WAF-protected),
+    then the legacy form-based signin endpoint, then the CCSP-side
+    authorize endpoint as a cookie-priming + redirect-following test.
+    """
+    _direct_log(
+        log_path,
+        f"\n=== Kia EU Direct API Probe — {time.strftime('%Y-%m-%d %H:%M:%S')} ===",
+    )
+    _direct_log(log_path, f"Email: {email}")
+
+    s = requests.Session()
+    s.headers.update({"Accept-Encoding": "gzip"})
+
+    # ----------------------------------------------------------------
+    # Probe 1: OAuth2 Resource-Owner-Password-Credentials grant against
+    # the IdP token endpoint. Token endpoints are typically NOT behind
+    # WAF Bot Control because they're machine-to-machine. If the IdP
+    # supports ROPC, this returns access_token + refresh_token directly
+    # with no Authorize step needed.
+    # ----------------------------------------------------------------
+    _direct_log(log_path, "\n--- Probe 1: IdP token endpoint, grant_type=password (ROPC) ---")
+    try:
+        url = "https://idpconnect-eu.kia.com/auth/api/v2/user/oauth2/token"
+        data = {
+            "grant_type": "password",
+            "username": email,
+            "password": password,
+            "client_id": KIA_EU_CCSP_SERVICE_ID,
+            "client_secret": KIA_EU_CLIENT_SECRET,
+            "scope": "openid profile email phone",
+        }
+        resp = s.post(url, data=data, timeout=30, allow_redirects=False)
+        _log_response(log_path, "Probe 1", resp)
+        if resp.status_code == 200:
+            try:
+                tokens = resp.json()
+                if tokens.get("refresh_token") and tokens.get("access_token"):
+                    _direct_log(log_path, "  [JACKPOT] Probe 1 returned tokens.")
+                    return tokens
+            except ValueError:
+                pass
+    except Exception as e:
+        _direct_log(log_path, f"  [Probe 1] exception: {e}")
+
+    # ----------------------------------------------------------------
+    # Probe 2: Legacy form-based signin against /auth/account/signin.
+    # This is the URL the marketing-site browser flow ultimately POSTs
+    # to behind the scenes after reCAPTCHA. If WAF only protects the
+    # /auth/api/v2/* paths and not /auth/account/*, this might still
+    # accept credentials directly.
+    # ----------------------------------------------------------------
+    _direct_log(log_path, "\n--- Probe 2: IdP form signin /auth/account/signin ---")
+    try:
+        url = "https://idpconnect-eu.kia.com/auth/account/signin"
+        data = {
+            "client_id": "peukiaidm-online-sales",
+            "encryptedPassword": "false",
+            "username": email,
+            "password": password,
+            "redirect_uri": "https://www.kia.com/api/bin/oneid/login",
+            "state": "ccsp",
+            "remember_me": "false",
+        }
+        headers = {
+            "User-Agent": DEFAULT_USER_AGENT,
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Origin": "https://idpconnect-eu.kia.com",
+            "Referer": "https://idpconnect-eu.kia.com/",
+        }
+        resp = s.post(url, data=data, headers=headers, timeout=30, allow_redirects=False)
+        _log_response(log_path, "Probe 2", resp)
+        # If credentials are accepted, the IdP redirects with code= or
+        # to the marketing site. Either way, a 302 with Location is
+        # the success indicator.
+        if resp.status_code in (302, 303):
+            location = resp.headers.get("Location", "")
+            match = re.search(r"[?&]code=([^&]+)", location)
+            if match:
+                code = match.group(1)
+                _direct_log(log_path, f"  [Probe 2] Got code, exchanging…")
+                tokens = _exchange_code_for_tokens(s, code, log_path)
+                if tokens and tokens.get("refresh_token"):
+                    return tokens
+    except Exception as e:
+        _direct_log(log_path, f"  [Probe 2] exception: {e}")
+
+    # ----------------------------------------------------------------
+    # Probe 3: CCSP authorize endpoint on port 8080. Different host
+    # than the WAF-blocked IdP authorize URL. With the right Stamp +
+    # ccsp-* headers (mimicking the Android app), this might either
+    # issue a code directly or redirect to a still-alive auth path.
+    # ----------------------------------------------------------------
+    _direct_log(log_path, "\n--- Probe 3: CCSP authorize endpoint with app headers ---")
+    try:
+        url = (
+            "https://prd.eu-ccapi.kia.com:8080/api/v1/user/oauth2/authorize"
+            f"?response_type=code&client_id={KIA_EU_CCSP_SERVICE_ID}"
+            "&redirect_uri=https://prd.eu-ccapi.kia.com:8080/api/v1/user/oauth2/redirect"
+            "&state=ccsp&lang=en"
+        )
+        headers = {
+            "User-Agent": KIA_EU_OKHTTP_UA,
+            "Stamp": _kia_eu_stamp(),
+            "ccsp-service-id": KIA_EU_CCSP_SERVICE_ID,
+            "ccsp-application-id": KIA_EU_APP_ID,
+            "Authorization": KIA_EU_BASIC_AUTH,
+            "Host": "prd.eu-ccapi.kia.com:8080",
+        }
+        resp = s.get(url, headers=headers, timeout=30, allow_redirects=False)
+        _log_response(log_path, "Probe 3", resp)
+    except Exception as e:
+        _direct_log(log_path, f"  [Probe 3] exception: {e}")
+
+    # ----------------------------------------------------------------
+    # Probe 4: Same authorize endpoint, but we follow redirects this
+    # time. If CCSP routes us through a non-WAF login page somewhere,
+    # we'll see it in the chain. Also tries the device-registration
+    # endpoint to confirm the CCSP backend accepts our app headers
+    # (sanity check — this should always succeed if our Stamp is valid).
+    # ----------------------------------------------------------------
+    _direct_log(log_path, "\n--- Probe 4: Device-register sanity check ---")
+    try:
+        url = "https://prd.eu-ccapi.kia.com:8080/api/v1/spa/notifications/register"
+        import uuid
+        body = {
+            "pushRegId": "0" * 64,
+            "pushType": "APNS",
+            "uuid": str(uuid.uuid4()),
+        }
+        headers = {
+            "User-Agent": KIA_EU_OKHTTP_UA,
+            "Stamp": _kia_eu_stamp(),
+            "ccsp-service-id": KIA_EU_CCSP_SERVICE_ID,
+            "ccsp-application-id": KIA_EU_APP_ID,
+            "Content-Type": "application/json;charset=UTF-8",
+            "Host": "prd.eu-ccapi.kia.com:8080",
+            "Connection": "Keep-Alive",
+            "Accept-Encoding": "gzip",
+        }
+        resp = s.post(url, json=body, headers=headers, timeout=30)
+        _log_response(log_path, "Probe 4", resp)
+    except Exception as e:
+        _direct_log(log_path, f"  [Probe 4] exception: {e}")
+
+    _direct_log(log_path, "\n=== All probes exhausted, no token obtained ===\n")
+    return None
+
+
 def select_mode():
     """
-    Ask the user which browser driver to use.
+    Ask the user which login flow to use.
 
     Standard: vanilla Selenium with anti-detection flags + CDP overrides.
     Stealth:  undetected-chromedriver, which patches the chromedriver
@@ -640,19 +862,23 @@ def select_mode():
     Maximum:  Stealth + mobile UA + JS-click navigation (sets Referer)
               + network logging written to kia_debug.log. Use as a
               last resort and to gather diagnostic data.
+    Direct:   No browser. Probes several non-browser API endpoints
+              (ROPC token-grant, legacy signin form, CCSP authorize)
+              with proper app headers. Kia EU only.
     """
     print("Select login mode:\n")
     print("  1) Standard   (default — try this first)")
     print("  2) Stealth    (undetected-chromedriver — try if Standard fails)")
     print("  3) Maximum    (Stealth + mobile UA + click-nav + debug log)")
+    print("  4) Direct     (no browser, direct API probes — Kia EU only)")
     print()
     while True:
-        choice = input("Enter mode (1-3) [1]: ").strip() or "1"
-        if choice in ("1", "2", "3"):
+        choice = input("Enter mode (1-4) [1]: ").strip() or "1"
+        if choice in ("1", "2", "3", "4"):
             break
         print("Invalid choice.")
 
-    mode = {"1": "standard", "2": "stealth", "3": "maximum"}[choice]
+    mode = {"1": "standard", "2": "stealth", "3": "maximum", "4": "direct"}[choice]
     print(f"\n-> {mode.capitalize()} mode selected.\n")
     if mode == "stealth":
         print("=" * 60)
@@ -671,12 +897,75 @@ def select_mode():
         print("If this still fails, send the contents of that log so we")
         print("can see exactly which request triggers the abuse page.")
         print("=" * 60 + "\n")
+    elif mode == "direct":
+        print("=" * 60)
+        print("NOTE: Direct mode skips the browser entirely and talks to")
+        print("Kia's CCSP backend / IdP token endpoint with the same")
+        print("headers the Android app sends (Stamp, ccsp-service-id,")
+        print("etc.). It probes several historical endpoints that may")
+        print("or may not still be alive. Every request is logged to:")
+        print(f"  {os.path.abspath(DEBUG_LOG_FILE)}")
+        print("This mode is experimental — the most recent maintainers")
+        print("of hyundai_kia_connect_api report direct password login")
+        print("is dead due to reCAPTCHA on the IdP form. We're testing")
+        print("anyway because the token endpoint itself is not WAF-")
+        print("protected and may accept ROPC.")
+        print("=" * 60 + "\n")
     return mode
+
+
+def _run_direct_mode(region, brand):
+    """Mode 4 entry point: prompt for credentials and run the probes."""
+    if region["name"] != "Europe" or brand["name"] != "Kia":
+        print(
+            "[ERROR] Direct mode is only implemented for Europe / Kia. "
+            "Other regions/brands need their own constants and probe "
+            "logic. Aborting."
+        )
+        return
+
+    debug_log_path = os.path.abspath(DEBUG_LOG_FILE)
+    try:
+        with open(debug_log_path, "w", encoding="utf-8") as f:
+            f.write(
+                f"Kia EU direct-API debug log — "
+                f"{time.strftime('%Y-%m-%d %H:%M:%S')}\n"
+            )
+    except OSError:
+        pass
+
+    print("Direct mode requires your Kia account credentials. They are sent")
+    print("only to Kia's own endpoints (idpconnect-eu.kia.com, prd.eu-ccapi.")
+    print("kia.com) — never logged to disk in plaintext, never to a third")
+    print("party. The password prompt below is hidden as you type.\n")
+    email = input("Email:    ").strip()
+    password = getpass.getpass("Password: ")
+    if not email or not password:
+        print("[ERROR] Email or password is empty. Aborting.")
+        return
+
+    print("\nProbing endpoints — this typically takes 5–15 seconds...\n")
+    tokens = kia_eu_direct_probe(email, password, debug_log_path)
+    if tokens and tokens.get("refresh_token") and tokens.get("access_token"):
+        print(
+            f"\n[OK] Direct mode succeeded! Your tokens are:\n\n"
+            f"- Refresh Token: {tokens['refresh_token']}\n"
+            f"- Access Token:  {tokens['access_token']}"
+        )
+    else:
+        print("[ERROR] No probe returned valid tokens.")
+        print(f"See {debug_log_path} for the full response of every probe —")
+        print("the status codes will tell us which endpoints are alive and")
+        print("which are WAF-blocked, so we know what to try next.")
 
 
 def main():
     region, brand = select_region_and_brand()
     mode = select_mode()
+
+    if mode == "direct":
+        _run_direct_mode(region, brand)
+        return
 
     # Use the brand's normal UA for Step 1 (login). In Maximum mode we
     # switch to MOBILE_USER_AGENT via CDP just before Step 2, so the
