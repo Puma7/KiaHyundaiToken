@@ -381,17 +381,28 @@ def _create_stealth_driver(user_agent):
 
     # Build options via uc.ChromeOptions — uc handles excludeSwitches,
     # useAutomationExtension and navigator.webdriver internally, so we
-    # only set the user agent here.
+    # only set the user agent here. --start-maximized is more reliable
+    # than driver.maximize_window() with uc on Windows.
     options = uc.ChromeOptions()
     options.add_argument(f"user-agent={user_agent}")
+    options.add_argument("--start-maximized")
 
+    print(
+        "[Stealth] Starting undetected Chrome — first run downloads and "
+        "patches its own ChromeDriver, this can take 10–30 seconds..."
+    )
     try:
         driver = uc.Chrome(
             options=options,
             version_main=_chrome_major_version(),
             use_subprocess=True,
         )
-        driver.maximize_window()
+        try:
+            driver.maximize_window()
+        except WebDriverException:
+            # Some uc + Windows combinations fail silently here; the
+            # --start-maximized flag is the real safeguard.
+            pass
         return driver
     except Exception as e:
         raise RuntimeError(
