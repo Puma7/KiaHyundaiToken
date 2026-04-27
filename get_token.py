@@ -2,6 +2,7 @@ import base64
 import datetime as dt
 import getpass
 import os
+import random
 import re
 import shutil
 
@@ -21,6 +22,30 @@ DEFAULT_USER_AGENT = (
     "AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/125.0.0.0 Safari/537.36_CCS_APP_AOS"
 )
+
+# Pool of plausible real-world browser User-Agents. The Direct probe
+# picks one at random per run so a sequence of users can't be trivially
+# fingerprinted as "all coming from the same tool". Not an evasion
+# tactic — a real user logging in from a different device every time
+# would also rotate. Mix of recent Chrome/Firefox/Safari/Edge across
+# Windows, macOS, Linux, Android, iOS.
+BROWSER_UA_POOL = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36 Edg/130.0.0.0",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:128.0) Gecko/20100101 Firefox/128.0",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:130.0) Gecko/20100101 Firefox/130.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_5) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Safari/605.1.15",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:128.0) Gecko/20100101 Firefox/128.0",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0",
+    "Mozilla/5.0 (Linux; Android 14; SM-S918B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Mobile Safari/537.36",
+    "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Mobile Safari/537.36",
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1",
+    "Mozilla/5.0 (iPad; CPU OS 17_5_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1",
+    "Mozilla/5.0 (Linux; Android 14; SAMSUNG SM-S928B) AppleWebKit/537.36 (KHTML, like Gecko) SamsungBrowser/26.0 Chrome/122.0.0.0 Mobile Safari/537.36",
+]
 
 DEBUG_LOG_FILE = "kia_debug.log"
 
@@ -479,17 +504,28 @@ def _exchange_code_for_tokens(session_obj, code, log_path):
         "client_secret": KIA_EU_CLIENT_SECRET,
     }
     _direct_log(log_path, f"\n  [Token exchange] POST {url}")
-    resp = session_obj.post(url, data=data, timeout=30)
+    try:
+        resp = session_obj.post(url, data=data, timeout=30)
+    except requests.RequestException as e:
+        _direct_log(log_path, f"  [Token exchange] network error: {e}")
+        return None
     _log_response(log_path, "Token exchange", resp)
-    if resp.status_code == 200:
+    if resp.status_code != 200:
+        return None
+    try:
         return resp.json()
-    return None
+    except ValueError:
+        _direct_log(log_path, "  [Token exchange] body was not valid JSON")
+        return None
 
 
 def _form_signin(session_obj, client_id, redirect_uri, email, password, log_path, label):
     """
     POST credentials to /auth/account/signin (NOT WAF-blocked). Returns
     the authorization code from the redirect Location, or None.
+
+    User-Agent comes from the session (set by kia_eu_direct_probe) so
+    the rotation is consistent within a single run.
     """
     url = "https://idpconnect-eu.kia.com/auth/account/signin"
     data = {
@@ -502,7 +538,6 @@ def _form_signin(session_obj, client_id, redirect_uri, email, password, log_path
         "remember_me": "false",
     }
     headers = {
-        "User-Agent": DEFAULT_USER_AGENT,
         "Content-Type": "application/x-www-form-urlencoded",
         "Origin": "https://idpconnect-eu.kia.com",
         "Referer": "https://idpconnect-eu.kia.com/",
@@ -540,8 +575,18 @@ def kia_eu_direct_probe(email, password, log_path):
     )
     _direct_log(log_path, f"Email: {email}")
 
+    # Pick a random browser UA per run so consecutive users of the
+    # script don't all share the exact same fingerprint at the IdP.
+    # All requests in this session use the same UA (one user, one
+    # browser, one session — what real traffic looks like).
+    chosen_ua = random.choice(BROWSER_UA_POOL)
+    _direct_log(log_path, f"User-Agent: {chosen_ua}")
+
     s = requests.Session()
-    s.headers.update({"Accept-Encoding": "gzip"})
+    s.headers.update({
+        "Accept-Encoding": "gzip",
+        "User-Agent": chosen_ua,
+    })
 
     # ----------------------------------------------------------------
     # Probe 1: OAuth2 Resource-Owner-Password-Credentials grant against
@@ -859,16 +904,23 @@ def _run_browser_flow(region, brand):
 
 
 def main():
-    region, brand = select_region_and_brand()
+    try:
+        region, brand = select_region_and_brand()
 
-    # Kia EU is fully browserless via direct-API login. Every other
-    # region/brand still uses the OAuth-via-browser flow because (a)
-    # they don't sit behind AWS WAF Bot Control and (b) we don't have
-    # validated app constants (Service ID, App ID, CFB key) for them.
-    if region["name"] == "Europe" and brand["name"] == "Kia":
-        _run_kia_eu_direct(region, brand)
-    else:
-        _run_browser_flow(region, brand)
+        # Kia EU is fully browserless via direct-API login. Every other
+        # region/brand still uses the OAuth-via-browser flow because (a)
+        # they don't sit behind AWS WAF Bot Control and (b) we don't have
+        # validated app constants (Service ID, App ID, CFB key) for them.
+        if region["name"] == "Europe" and brand["name"] == "Kia":
+            _run_kia_eu_direct(region, brand)
+        else:
+            _run_browser_flow(region, brand)
+    except KeyboardInterrupt:
+        # Catches Ctrl+C during select prompts, email input, or the
+        # direct probe — keeps the terminal output clean instead of
+        # dumping a traceback. The browser flow has its own
+        # KeyboardInterrupt handler that also runs driver.quit().
+        print("\n[ERROR] Interrupted by user.")
 
 
 if __name__ == "__main__":
