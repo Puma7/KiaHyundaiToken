@@ -1,3 +1,4 @@
 selenium>=4.6.0
 requests>=2.28.0
 chromedriver-autoinstaller>=0.6.2
+undetected-chromedriver>=3.5.5

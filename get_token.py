@@ -321,12 +321,8 @@ def _is_safe_to_delete(driver_path):
     return bool(re.match(r"^\d+\.\d+\.\d+(\.\d+)?$", dirname))
 
 
-def create_driver(user_agent):
-    """
-    Install chromedriver and start Chrome with anti-detection flags.
-    Retries once with a clean reinstall if the first attempt fails.
-    Raises RuntimeError if Chrome cannot be started.
-    """
+def _create_standard_driver(user_agent):
+    """Standard Selenium + chromedriver-autoinstaller path."""
     driver_path = install_chromedriver()
 
     try:
@@ -354,6 +350,65 @@ def create_driver(user_agent):
             raise RuntimeError(
                 f"Could not start Chrome after reinstall: {e}"
             ) from e
+
+
+def _chrome_major_version():
+    """Return the installed Chrome major version (e.g. 125), or None."""
+    try:
+        full = chromedriver_autoinstaller.get_chrome_version()
+        # Returns a string like "125.0.6422.78"
+        return int(full.split(".")[0])
+    except Exception:
+        return None
+
+
+def _create_stealth_driver(user_agent):
+    """
+    Stealth path using undetected-chromedriver. Patches the chromedriver
+    binary at runtime to drop cdc_ markers, hides navigator.webdriver,
+    and strips automation switches that the standard path can only mask.
+
+    Use this when the standard path fails with anti-bot detection
+    (e.g. Kia EU IdP "abusing request" 400).
+    """
+    try:
+        import undetected_chromedriver as uc
+    except ImportError as e:
+        raise RuntimeError(
+            "Stealth mode requires the 'undetected-chromedriver' package. "
+            "Install it with: python -m pip install undetected-chromedriver"
+        ) from e
+
+    # Build options via uc.ChromeOptions — uc handles excludeSwitches,
+    # useAutomationExtension and navigator.webdriver internally, so we
+    # only set the user agent here.
+    options = uc.ChromeOptions()
+    options.add_argument(f"user-agent={user_agent}")
+
+    try:
+        driver = uc.Chrome(
+            options=options,
+            version_main=_chrome_major_version(),
+            use_subprocess=True,
+        )
+        driver.maximize_window()
+        return driver
+    except Exception as e:
+        raise RuntimeError(
+            f"Could not start Chrome in stealth mode: {e}"
+        ) from e
+
+
+def create_driver(user_agent, mode="standard"):
+    """
+    Install chromedriver and start Chrome with anti-detection flags.
+
+    mode: "standard" (default) or "stealth".
+    Raises RuntimeError if Chrome cannot be started.
+    """
+    if mode == "stealth":
+        return _create_stealth_driver(user_agent)
+    return _create_standard_driver(user_agent)
 
 
 def select_region_and_brand():
@@ -408,14 +463,46 @@ def select_region_and_brand():
     return region, brand
 
 
+def select_mode():
+    """
+    Ask the user which browser driver to use.
+
+    Standard: vanilla Selenium with anti-detection flags + CDP overrides.
+    Stealth:  undetected-chromedriver, which patches the chromedriver
+              binary at runtime. Try this if Standard hits Kia's
+              "abusing request" 400 or similar bot-detection blocks.
+    """
+    print("Select login mode:\n")
+    print("  1) Standard   (default — try this first)")
+    print("  2) Stealth    (undetected-chromedriver — try if Standard fails)")
+    print()
+    while True:
+        choice = input("Enter mode (1-2) [1]: ").strip() or "1"
+        if choice in ("1", "2"):
+            break
+        print("Invalid choice.")
+
+    mode = "stealth" if choice == "2" else "standard"
+    print(f"\n-> {mode.capitalize()} mode selected.\n")
+    if mode == "stealth":
+        print("=" * 60)
+        print("NOTE: Stealth mode uses undetected-chromedriver. It will")
+        print("download its own ChromeDriver on first run and may take a")
+        print("few extra seconds to start. If it fails to launch, fall")
+        print("back to Standard mode.")
+        print("=" * 60 + "\n")
+    return mode
+
+
 def main():
     region, brand = select_region_and_brand()
+    mode = select_mode()
 
     user_agent = brand.get("user_agent", DEFAULT_USER_AGENT)
 
     driver = None
     try:
-        driver = create_driver(user_agent)
+        driver = create_driver(user_agent, mode=mode)
 
         print(f"Opening {brand['name']} ({region['name']}) login page...")
         driver.get(brand["login_url"])
