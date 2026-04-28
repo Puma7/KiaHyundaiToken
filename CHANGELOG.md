@@ -1,5 +1,71 @@
 # Changelog
 
+## [3.8.0] - 2026-04-28
+
+### The chain is fully characterized
+
+The v3.7.0 `--debug-all-probes` run gave us the conclusive answer
+on Probe 7. The error message — finally extracted thanks to v3.7.0's
+deeper diagnostics — was:
+
+```
+[Probe 7] Keycloak error: 'recaptcha_failed_v3' (login form re-rendered)
+```
+
+The backend Keycloak realm's login form requires a Google reCAPTCHA v3
+token (site key `6Ld2GsMrAAAAALfCHMn7fAVEK898yPTFQNYMmNss`). The form
+embeds `<input type="hidden" name="g-recaptcha-response">` that must
+contain a Google-signed token before submission. Without running
+Google's JS in a real browser, we cannot generate that token, and
+the backend rejects the POST.
+
+This is by design: every browser-rendered Kia login surface (fassade
+AND backend) enforces reCAPTCHA. The only path that doesn't is the
+REST API at `/auth/account/signin`, which is what Probes 0-2 use.
+That endpoint is exempt from reCAPTCHA because it's designed for the
+official mobile app — which has its own attestation (SafetyNet /
+Play Integrity) signalling "real device" so reCAPTCHA isn't needed.
+Probes 0-2 piggyback on that exemption.
+
+**Probe 7 is now marked HISTORICAL.** The probe chain is complete:
+
+| Probe | Status | Why |
+|---|---|---|
+| 0 — Plain stdlib signin | **PASS** | REST API at `/auth/account/signin` (no reCAPTCHA, no WAF) |
+| 1 — App-flow (curl_cffi + RSA) | **PASS** | Same endpoint as 0, with mobile-app TLS + RSA-encrypted password |
+| 2 — Legacy (curl_cffi + plaintext) | **PASS** | Same endpoint, mobile-app TLS, plaintext password |
+| 3 — Marketing → CCSP cookie reuse | DEAD | AWS WAF deletes session cookies on CCSP authorize call |
+| 4 — OIDC discovery at fassade | DEAD | `/.well-known/openid-configuration` returns 404 |
+| 5 — Backend Keycloak ROPC sweep | DEAD | Found 4 existing clients (peukiaidm, account, account-console, admin-cli) — all have ROPC disabled |
+| 6 — Device flow at backend | DEAD | Same 4 clients all have device_code grant disabled |
+| 7 — Backend authorization_code | DEAD | Backend login form requires Google reCAPTCHA v3 token (`recaptcha_failed_v3`) |
+
+Three working, independent paths (0/1/2). Five fully-characterized
+dead ends, each documented with the exact reason and (where useful)
+the diagnostic command that revealed it. No further probes planned —
+without reverse-engineering the official mobile app's attestation
+or paying for a CAPTCHA-solving service, this is the boundary of
+what's possible.
+
+### Changed
+
+- `_probe_backend_auth_code` docstring updated to HISTORICAL with
+  the concrete reCAPTCHA v3 finding (site key, error code, why
+  REST endpoints are exempt).
+
+### Notes
+
+If the day ever comes when:
+- Kia adds a new backend client with reCAPTCHA-disabled, OR
+- Kia exposes the existing clients' ROPC/device flow grants, OR
+- A non-fassade browser flow opens up (e.g. dedicated mobile
+  endpoint without challenge),
+
+the existing Probe 5/6/7 code will pick it up automatically the
+next time someone runs `--debug-all-probes`. That's the value of
+keeping these probes around even when they currently fail — they're
+running test cases for any future hardening reversal.
+
 ## [3.7.0] - 2026-04-28
 
 ### Diagnostic findings from v3.6.0 `--debug-all-probes`

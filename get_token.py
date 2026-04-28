@@ -15,7 +15,7 @@ gets at least one chance to recover.
 See README for usage and CHANGELOG for version history.
 """
 
-__version__ = "3.7.0"
+__version__ = "3.8.0"
 
 import argparse
 import base64
@@ -1468,8 +1468,30 @@ def _interactive_device_flow_complete(s, finding, log_path):
 # ---------------------------------------------------------------------------
 def _probe_backend_auth_code(s, brand_config, email, password, log_path):
     """
-    Probe 7: try the standard Keycloak authorization_code flow at
-    the backend realm. Returns tokens dict on success, None otherwise.
+    Probe 7 (HISTORICAL — confirmed not viable as of v3.7.0 debug run
+    on 2026-04-28): try the standard Keycloak authorization_code flow
+    at the backend realm. Returns tokens dict on success, None
+    otherwise.
+
+    Why it doesn't work: the backend Keycloak login form has Google
+    reCAPTCHA v3 wired in (site key `6Ld2GsMrAAAAALfCHMn7fAVEK898yPTFQNYMmNss`).
+    The form embeds an `<input type="hidden" name="g-recaptcha-response">`
+    that must contain a valid Google-signed token before submission.
+    Without running Google's JS in a real browser, we cannot obtain
+    that token, and the backend rejects the POST with `recaptcha_failed_v3`.
+
+    This is by design: every browser-rendered Kia login surface (fassade
+    UI + backend UI) enforces reCAPTCHA. The REST API at
+    /auth/account/signin (Probes 0-2) does NOT enforce reCAPTCHA — it's
+    designed for the official mobile app, which has its own attestation
+    (SafetyNet/Play Integrity) that signals "real device" without
+    needing a JS challenge. We piggyback on that REST endpoint.
+
+    Kept in the chain because: (a) zero cost on success-from-probe-N<7,
+    (b) if Kia ever removes reCAPTCHA from the backend or adds a
+    different client without it, this probe would automatically pick
+    it up, (c) the diagnostic log makes the architectural picture
+    clear for future contributors.
     """
     realm_url = brand_config.get("backend_realm_url")
     if not realm_url:
