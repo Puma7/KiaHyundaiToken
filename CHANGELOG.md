@@ -1,5 +1,75 @@
 # Changelog
 
+## [3.4.0] - 2026-04-28
+
+### Diagnostic findings from v3.3.0 `--debug-all-probes`
+
+Run against a real Kia EU account on 2026-04-28 produced this picture
+of the chain. We now treat it as the definitive map:
+
+| Probe | Result | What it tells us |
+|---|---|---|
+| 0 — Plain stdlib signin | PASS | The v3.0 path still works. Battle-tested primary. |
+| 1 — App-flow + RSA + curl_cffi | PASS | TMA84-style app-flow also works. Future-proof against Kia ever requiring `encryptedPassword=true`. |
+| 2 — Legacy + curl_cffi | PASS | Plaintext signin via curl_cffi works. Survives if plain `requests` ever gets TLS-filtered. |
+| 3 — Marketing → CCSP via cookie reuse | FAIL | WAF deletes the marketing-signin cookies (Set-Cookie Max-Age=0) on the next request. Cookie-reuse bypass is not viable. |
+| 4 — OIDC discovery at fassade | FAIL | `idpconnect-eu.kia.com/.well-known/openid-configuration` returns 404. Fassade hides discovery. |
+| 5 — Backend Keycloak realm | FAIL but ⚠️ INSIGHTFUL | Backend at `eu-account.kia.com/auth/realms/eukiaidm` IS publicly reachable. Discovery returns full metadata advertising `password`, `device_code`, etc. The fassade client_id `fdc85c00...` returns `invalid_client` here — backend has its own client registry. |
+
+### Added
+
+- **Probe 5 enumeration**: now sweeps `BACKEND_CLIENT_CANDIDATES` (a
+  list of plausible client_ids — known fassade clients, Keycloak
+  defaults, speculative Kia naming patterns) at the backend realm
+  and **distinguishes** the failure modes:
+  - `invalid_client` → client unknown at backend, try next
+  - `unauthorized_client` → client EXISTS but ROPC disabled
+  - `invalid_grant` → client EXISTS, ROPC works, just credentials
+    rejected — that's a major future-feature pointer
+  - `200 + tokens` → JACKPOT, fully WAF-independent path
+
+  The debug log calls out any client that returned `invalid_grant`
+  or `unauthorized_client` separately at the bottom, so a future
+  contributor can see at a glance what's reachable.
+
+- **Probe 6 (NEW)**: device flow at the backend Keycloak realm.
+  The realm advertises `urn:ietf:params:oauth:grant-type:device_code`
+  in `grant_types_supported`. Probe 6 in the chain is **discovery-
+  only** — it sweeps client_id candidates at
+  `device_authorization_endpoint`, logs which ones accept a
+  device-code request, but does NOT block waiting for user input.
+
+- **`--device-flow` CLI flag**: explicit interactive mode for
+  Probe 6. Uses the same client_id sweep, picks the first usable
+  client, prints the verification URL, and polls the token endpoint
+  until the user logs in (or 10 min timeout). User authenticates on
+  Kia's official Keycloak page — no password sent from this script.
+  Tokens come from the backend realm with `iss` = the realm URL,
+  not `iss = "uvo"` like the working probes 0-2 — caveat printed
+  to user, since Home Assistant may need an `iss = uvo` token.
+
+### Changed
+
+- **Probes 3 and 4 marked HISTORICAL** in their docstrings. They
+  do not currently produce tokens and are confirmed not viable as
+  bypass paths. Kept in the chain for documentation value, the
+  zero-cost-on-success-from-earlier-probe contract, and so the
+  debug log makes it easy to confirm Kia's behavior hasn't
+  changed.
+
+### Notes
+
+- Probes 0, 1, 2 = three independent **working** paths. Each uses
+  different libraries / encryption / TLS profiles, so the
+  probability of all three breaking simultaneously is very low.
+- Probes 3, 4 = **historical, expected to fail**. They document
+  WAF behavior and serve as continuity check.
+- Probes 5, 6 = **research paths**. Not currently producing
+  tokens, but Probe 5's enumeration logs help future contributors
+  who reverse-engineer the official app to find the right backend
+  client_id. Adding it to `BACKEND_CLIENT_CANDIDATES` would
+  immediately give us a fourth working path.
+
 ## [3.3.0] - 2026-04-28
 
 ### Added

@@ -15,7 +15,7 @@ gets at least one chance to recover.
 See README for usage and CHANGELOG for version history.
 """
 
-__version__ = "3.3.0"
+__version__ = "3.4.0"
 
 import argparse
 import base64
@@ -533,6 +533,55 @@ TLS_IMPERSONATE_POOL = [
 ]
 
 
+# ---------------------------------------------------------------------------
+# Client-ID candidates for Probe 5 (backend Keycloak realm) and Probe 6
+# (device flow). Enumerated because the v3.3.0 debug-all run proved that
+# the backend realm at eu-account.kia.com IS publicly reachable AND
+# advertises grant_types_supported = [..., 'password', 'device_code', ...],
+# but the public-fassade client_id "fdc85c00..." gets rejected with
+# "invalid_client". The backend realm has its own client registry,
+# distinct from what the fassade exposes. So we sweep a list of
+# plausible client_ids:
+#
+#   - The known fassade client (current v3.3.0 default — known to fail
+#     with "invalid_client" at the backend, included here for the
+#     summary log).
+#   - Marketing client (works at fassade for browser logins).
+#   - Default Keycloak public clients (`account`, `account-console`,
+#     `admin-cli`) — these always exist in any Keycloak realm and
+#     sometimes have direct-grants enabled.
+#   - Speculative names following Kia naming conventions (kia-connect,
+#     kia-app, eukiaidm-connect-app, etc.).
+#
+# Each entry is (client_id, client_secret). secret=None means "public
+# client, do not send client_secret". A "200 with tokens" on any
+# combination is a Jackpot — fully WAF-bypassing path. An
+# "invalid_grant" instead of "invalid_client" tells us a client EXISTS
+# at the backend but the password we sent didn't validate — that's
+# also a major finding and goes prominently into the log.
+# ---------------------------------------------------------------------------
+BACKEND_CLIENT_CANDIDATES = [
+    # (client_id, client_secret, comment)
+    ("fdc85c00-0a2f-4c64-bcb4-2cfb1500730a", "secret",
+     "fassade CCSP client (known to fail at backend, kept for record)"),
+    ("peukiaidm-online-sales", None,
+     "fassade marketing client (try at backend without secret)"),
+    ("account", None,
+     "Keycloak default account console client"),
+    ("account-console", None,
+     "Keycloak default account console client (newer naming)"),
+    ("admin-cli", None,
+     "Keycloak default admin-cli (rarely has direct grants but cheap to try)"),
+    ("kia-connect", None,
+     "speculative — mobile app naming"),
+    ("kia-connect-app", None,
+     "speculative — mobile app naming"),
+    ("eukiaidm-connect-app", None,
+     "speculative — fassade-style naming"),
+    ("eukiaidm-app", None,
+     "speculative — fassade-style naming"),
+]
+
 
 def _direct_log(log_path, text):
     """Best-effort append to the debug log."""
@@ -774,9 +823,23 @@ def _form_signin_legacy(s, brand_config, email, password, log_path):
 # ---------------------------------------------------------------------------
 def _probe_marketing_to_ccsp(s, brand_config, email, password, log_path):
     """
-    Sign in via the marketing OAuth client to seed cookies, then use
-    the same session to GET the CCSP authorize endpoint. Returns a
-    CCSP authorization code on success, or None.
+    Probe 3 (HISTORICAL — confirmed not working as of v3.3.0 debug
+    run on 2026-04-28): sign in via the marketing OAuth client to
+    seed cookies, then use the same session to GET the CCSP authorize
+    endpoint. Returns a CCSP authorization code on success, or None.
+
+    Why we keep it: the marketing-cookie-reuse trick was a plausible
+    bypass of WAF Bot Control on the CCSP authorize endpoint (after
+    a marketing signin we have aws-waf-token + KEYCLOAK_IDENTITY
+    cookies that should make us look like a legit returning user).
+    Empirically the WAF deletes those cookies on the next request
+    (Set-Cookie Max-Age=0) and 302-loops the authorize URL.
+
+    Kept in the chain anyway because: (a) zero cost when probes 0-2
+    have already won and we early-return, (b) future Kia config
+    changes might re-open the path, (c) the diagnostic log lines
+    from this probe are valuable for confirming the WAF is still
+    behaving the same way.
     """
     if not brand_config.get("marketing_client_id"):
         _direct_log(log_path, "  [Probe 3] no marketing_client_id configured, skipping.")
@@ -851,8 +914,21 @@ def _probe_marketing_to_ccsp(s, brand_config, email, password, log_path):
 # ---------------------------------------------------------------------------
 def _probe_oidc_discovery(s, brand_config, email, password, log_path):
     """
-    Fetch /.well-known/openid-configuration and try ROPC at any
-    advertised token endpoint that supports grant_type=password.
+    Probe 4 (HISTORICAL — confirmed not useful as of v3.3.0 debug run
+    on 2026-04-28): fetch /.well-known/openid-configuration on the
+    public fassade and try ROPC at any advertised token_endpoint that
+    supports grant_type=password.
+
+    Why it doesn't work: the fassade at idpconnect-eu.kia.com hides
+    OIDC discovery — the well-known URL returns 404. So we never get
+    metadata to act on. The backend realm (Probe 5) DOES expose
+    discovery, but that's covered there.
+
+    Kept in the chain because: (a) zero cost on success-from-probe-N<4,
+    (b) if Kia ever turns on discovery on the fassade we'd
+    automatically see the new endpoints, (c) the 404 itself is a
+    useful confirmation in the debug log.
+
     Returns a token dict on success, None otherwise. (Returns full
     tokens directly because OIDC ROPC bypasses the code-exchange
     step entirely.)
@@ -957,11 +1033,10 @@ def _probe_oidc_discovery(s, brand_config, email, password, log_path):
 # implementation; if it works, it's a clean fully-headless path
 # completely independent of the WAF-protected fassade.
 # ---------------------------------------------------------------------------
-def _probe_backend_realm(s, brand_config, email, password, log_path):
+def _backend_realm_discover(s, brand_config, log_path):
     """
-    Hit the backend Keycloak realm at eu-account.kia.com directly.
-    Try (a) discovery to confirm reachability, (b) ROPC token grant.
-    Returns a token dict on success, None otherwise.
+    Fetch backend realm OIDC metadata. Returns the parsed config dict
+    on success, None on any failure. Also logs interesting metadata.
     """
     realm_url = brand_config.get("backend_realm_url")
     if not realm_url:
@@ -994,11 +1069,42 @@ def _probe_backend_realm(s, brand_config, email, password, log_path):
         "issuer",
         "token_endpoint",
         "authorization_endpoint",
+        "device_authorization_endpoint",
         "grant_types_supported",
         "token_endpoint_auth_methods_supported",
     ):
         if key in config:
             _direct_log(log_path, f"    {key}: {_safe_truncate(config[key], 200)}")
+
+    return config
+
+
+def _probe_backend_realm(s, brand_config, email, password, log_path):
+    """
+    Probe 5: enumerate Client-IDs at the backend Keycloak realm.
+
+    The v3.3.0 debug-all run confirmed that:
+      - The backend realm at eu-account.kia.com IS publicly reachable
+      - It advertises grant_types_supported including 'password' (ROPC)
+        and 'urn:ietf:params:oauth:grant-type:device_code'
+      - But the fassade client_id "fdc85c00..." is NOT registered there
+        (returns "invalid_client")
+
+    So we sweep BACKEND_CLIENT_CANDIDATES — each candidate is a (client_id,
+    secret) pair we try with grant_type=password. The error code that
+    comes back tells us about each client:
+      - "invalid_client"     → client_id doesn't exist at this realm
+      - "unauthorized_client"→ client exists but ROPC not enabled for it
+      - "invalid_grant"      → client EXISTS, ROPC enabled, but the
+                               username/password combination didn't auth
+                               (or the user needs MFA, etc.) — that's
+                               still a major finding because it means
+                               the client is real
+      - 200 + tokens         → JACKPOT — fully WAF-independent path
+    """
+    config = _backend_realm_discover(s, brand_config, log_path)
+    if not config:
+        return None
 
     token_endpoint = config.get("token_endpoint")
     if not token_endpoint:
@@ -1008,40 +1114,308 @@ def _probe_backend_realm(s, brand_config, email, password, log_path):
     if "password" not in grant_types:
         _direct_log(
             log_path,
-            "  [Probe 5] backend realm doesn't advertise ROPC, nothing more to try.",
+            "  [Probe 5] backend realm doesn't advertise ROPC, nothing to try.",
         )
         return None
 
     _direct_log(
         log_path,
-        f"\n  [Probe 5 — Backend ROPC] POST {token_endpoint} grant_type=password",
+        f"\n  [Probe 5 — Backend ROPC] sweeping {len(BACKEND_CLIENT_CANDIDATES)} client_id candidates at {token_endpoint}",
     )
-    try:
-        resp = s.post(
-            token_endpoint,
-            data={
-                "grant_type": "password",
-                "username": email,
-                "password": password,
-                "client_id": brand_config["client_id"],
-                "client_secret": brand_config["client_secret"],
-                "scope": "openid profile email phone",
-            },
-            timeout=30,
+
+    found_existing = []  # [(client_id, error)] for clients that exist but failed auth
+
+    for client_id, client_secret, comment in BACKEND_CLIENT_CANDIDATES:
+        data = {
+            "grant_type": "password",
+            "username": email,
+            "password": password,
+            "client_id": client_id,
+            "scope": "openid profile email phone",
+        }
+        if client_secret is not None:
+            data["client_secret"] = client_secret
+
+        secret_label = "(secret)" if client_secret else "(public)"
+        _direct_log(
+            log_path,
+            f"\n    [Probe 5 try] client_id={client_id} {secret_label}  [{comment}]",
         )
-    except Exception as exc:
-        _direct_log(log_path, f"  [Probe 5 ROPC] network error: {exc}")
+        try:
+            resp = s.post(token_endpoint, data=data, timeout=15)
+        except Exception as exc:
+            _direct_log(log_path, f"      network error: {exc}")
+            continue
+
+        if resp.status_code == 200:
+            try:
+                tokens = resp.json()
+            except ValueError:
+                _direct_log(log_path, "      200 but body not JSON")
+                continue
+            if tokens.get("refresh_token") and tokens.get("access_token"):
+                _direct_log(
+                    log_path,
+                    f"      [JACKPOT] {client_id} accepted credentials — "
+                    "fully WAF-independent path.",
+                )
+                return tokens
+            _direct_log(log_path, "      200 but no tokens in response")
+            continue
+
+        # Non-200: parse error code from response body to classify the failure.
+        body = resp.text or ""
+        error = ""
+        try:
+            err_json = resp.json()
+            error = err_json.get("error", "")
+        except ValueError:
+            pass
+
+        if error == "invalid_client":
+            _direct_log(log_path, f"      → invalid_client (client unknown at backend)")
+        elif error == "unauthorized_client":
+            _direct_log(
+                log_path,
+                f"      → unauthorized_client (CLIENT EXISTS but ROPC not enabled for it)",
+            )
+            found_existing.append((client_id, "ROPC disabled"))
+        elif error == "invalid_grant":
+            _direct_log(
+                log_path,
+                f"      → invalid_grant (CLIENT EXISTS — credentials wrong, or MFA required)",
+            )
+            found_existing.append((client_id, "credentials rejected"))
+        else:
+            _direct_log(
+                log_path,
+                f"      → status={resp.status_code} error={error or 'unknown'} "
+                f"body[:200]={_safe_truncate(body, 200)}",
+            )
+
+    # No success, but log any "real" clients we found
+    if found_existing:
+        _direct_log(log_path, "\n  [Probe 5] EXISTING backend clients discovered:")
+        for cid, reason in found_existing:
+            _direct_log(log_path, f"    - {cid} ({reason})")
+        _direct_log(
+            log_path,
+            "  These would work if we had the right secret / second factor / "
+            "authorization. Future-feature opportunity.",
+        )
+    else:
+        _direct_log(
+            log_path,
+            "  [Probe 5] None of the candidate client_ids are registered at the backend realm.",
+        )
+
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Probe 6: device flow (RFC 8628) at the backend Keycloak realm.
+#
+# The backend realm advertises 'urn:ietf:params:oauth:grant-type:device_code'
+# in grant_types_supported. Device flow doesn't require credentials in
+# the headless path — instead, it returns a verification_uri + user_code
+# which the user opens in any browser (their phone, another PC), logs in
+# there, and we poll for tokens. This means:
+#   - The user authenticates on Kia's official Keycloak page (no WAF
+#     bypass needed — they ARE the browser this time).
+#   - Our headless code never touches credentials directly.
+#   - Tokens are issued by the backend realm (Keycloak-native tokens),
+#     same as Probe 5 ROPC would have given us.
+#
+# Caveat: device flow ALSO needs a valid backend client_id (same blocker
+# as Probe 5). So we sweep the same candidate list at the device-init
+# endpoint. If any returns a device_code, we record the capability —
+# in normal/debug mode that's all we do (device flow needs interactive
+# user input, can't run blocking by default). The user can then opt in
+# with `--device-flow` to actually go through the polling cycle.
+#
+# Even if no candidate works today, the discovery output is logged for
+# future iteration: someone reverse-engineering the app may find a real
+# backend client_id and add it to BACKEND_CLIENT_CANDIDATES.
+# ---------------------------------------------------------------------------
+def _probe_device_flow_discover(s, brand_config, log_path):
+    """
+    Initiate device flow against backend realm with each candidate
+    client_id. Returns a list of usable
+    {client_id, device_code, user_code, verification_uri,
+     verification_uri_complete, expires_in, interval} dicts (empty if
+    none worked). Does NOT poll — see _interactive_device_flow_complete.
+    """
+    config = _backend_realm_discover(s, brand_config, log_path)
+    if not config:
+        return []
+
+    device_endpoint = config.get("device_authorization_endpoint")
+    if not device_endpoint:
+        _direct_log(
+            log_path,
+            "  [Probe 6] backend realm doesn't advertise device_authorization_endpoint",
+        )
+        return []
+
+    grant_types = config.get("grant_types_supported", []) or []
+    if "urn:ietf:params:oauth:grant-type:device_code" not in grant_types:
+        _direct_log(log_path, "  [Probe 6] device_code grant not advertised")
+        return []
+
+    _direct_log(
+        log_path,
+        f"\n  [Probe 6 — Device flow init] sweeping candidates at {device_endpoint}",
+    )
+
+    findings = []
+    for client_id, client_secret, comment in BACKEND_CLIENT_CANDIDATES:
+        data = {"client_id": client_id, "scope": "openid"}
+        if client_secret is not None:
+            data["client_secret"] = client_secret
+
+        secret_label = "(secret)" if client_secret else "(public)"
+        _direct_log(log_path, f"\n    [Probe 6 try] client_id={client_id} {secret_label}")
+        try:
+            resp = s.post(device_endpoint, data=data, timeout=15)
+        except Exception as exc:
+            _direct_log(log_path, f"      network error: {exc}")
+            continue
+
+        if resp.status_code == 200:
+            try:
+                body = resp.json()
+            except ValueError:
+                _direct_log(log_path, "      200 but body not JSON")
+                continue
+            if not (body.get("device_code") and body.get("user_code")):
+                _direct_log(log_path, "      200 but missing device_code/user_code")
+                continue
+            finding = {
+                "client_id": client_id,
+                "client_secret": client_secret,
+                "device_code": body["device_code"],
+                "user_code": body["user_code"],
+                "verification_uri": body.get("verification_uri", ""),
+                "verification_uri_complete": body.get("verification_uri_complete")
+                                           or body.get("verification_uri", ""),
+                "expires_in": body.get("expires_in", 600),
+                "interval": body.get("interval", 5),
+                "token_endpoint": config.get("token_endpoint"),
+            }
+            findings.append(finding)
+            _direct_log(
+                log_path,
+                f"      [USABLE] device_code received, user_code={body['user_code']}, "
+                f"verification_uri={finding['verification_uri']}",
+            )
+            continue
+
+        # Non-200: classify
+        try:
+            err_json = resp.json()
+            err = err_json.get("error", "")
+        except ValueError:
+            err = ""
+        if err:
+            _direct_log(log_path, f"      → status={resp.status_code} error={err}")
+        else:
+            body_preview = _safe_truncate(resp.text or "", 200)
+            _direct_log(log_path, f"      → status={resp.status_code} body[:200]={body_preview}")
+
+    if findings:
+        _direct_log(
+            log_path,
+            f"\n  [Probe 6] {len(findings)} candidate(s) accepted device-flow init "
+            "— interactive flow available via --device-flow",
+        )
+    else:
+        _direct_log(log_path, "\n  [Probe 6] no client_id accepted device-flow init")
+    return findings
+
+
+def _interactive_device_flow_complete(s, finding, log_path):
+    """
+    Given a device-flow finding, present the verification URI to the
+    user and poll the token endpoint until they authenticate (or
+    expiration). Returns tokens dict on success, None on failure or
+    user-canceled.
+    """
+    print()
+    print("=" * 60)
+    print("DEVICE FLOW — interactive login")
+    print("=" * 60)
+    print()
+    print("Open this URL in any browser (your phone is fine):")
+    print(f"  {finding['verification_uri_complete']}")
+    print()
+    if finding['user_code'] not in (finding['verification_uri_complete'] or ""):
+        print(f"If asked, enter this code: {finding['user_code']}")
+        print()
+    print(f"Log in with your Kia account on that page.")
+    print(f"This script will pick up automatically once you're done.")
+    print(f"(timeout: {finding['expires_in']}s, polling every {finding['interval']}s)")
+    print()
+    print("Press Ctrl+C to abort.")
+    print()
+
+    deadline = time.time() + finding["expires_in"]
+    interval = max(int(finding["interval"]), 1)
+    poll_data = {
+        "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
+        "device_code": finding["device_code"],
+        "client_id": finding["client_id"],
+    }
+    if finding.get("client_secret") is not None:
+        poll_data["client_secret"] = finding["client_secret"]
+
+    while time.time() < deadline:
+        try:
+            time.sleep(interval)
+        except KeyboardInterrupt:
+            print("\nDevice flow aborted by user.")
+            return None
+        try:
+            resp = s.post(finding["token_endpoint"], data=poll_data, timeout=15)
+        except Exception as exc:
+            _direct_log(log_path, f"  [Device flow poll] network error: {exc}")
+            print(".", end="", flush=True)
+            continue
+
+        if resp.status_code == 200:
+            try:
+                tokens = resp.json()
+            except ValueError:
+                continue
+            if tokens.get("refresh_token") and tokens.get("access_token"):
+                print("\n[OK] Device flow completed.")
+                _direct_log(log_path, "  [Device flow] SUCCESS — tokens received.")
+                return tokens
+            continue
+
+        try:
+            err_json = resp.json()
+            err = err_json.get("error", "")
+        except ValueError:
+            err = ""
+        if err == "authorization_pending":
+            print(".", end="", flush=True)
+            continue
+        if err == "slow_down":
+            interval += 1
+            print("(slowing down)", end=" ", flush=True)
+            continue
+        if err == "expired_token":
+            print("\n[ERROR] Device code expired — start over.")
+            return None
+        if err == "access_denied":
+            print("\n[ERROR] Authorization denied on the verification page.")
+            return None
+        # Unknown error
+        body_preview = _safe_truncate(resp.text or "", 200)
+        print(f"\n[ERROR] Device flow polling returned status={resp.status_code} body={body_preview}")
         return None
-    _log_response(log_path, "Probe 5 ROPC", resp)
-    if resp.status_code != 200:
-        return None
-    try:
-        tokens = resp.json()
-    except ValueError:
-        return None
-    if tokens.get("refresh_token") and tokens.get("access_token"):
-        _direct_log(log_path, "  [Probe 5] backend-realm ROPC SUCCEEDED — clean WAF-bypass path.")
-        return tokens
+
+    print("\n[ERROR] Device flow timed out without completion.")
     return None
 
 
@@ -1250,7 +1624,7 @@ PROBE_RUNNERS = [
     ),
     (
         5,
-        "Backend Keycloak realm (eu-account.*) direct ROPC",
+        "Backend Keycloak realm (eu-account.*) direct ROPC sweep",
         "curl",
         lambda s, bc, em, pw, lp: _finalize_tokens(
             _probe_backend_realm(s, bc, em, pw, lp),
@@ -1258,6 +1632,19 @@ PROBE_RUNNERS = [
             bc,
             lp,
         ),
+    ),
+    (
+        6,
+        "Device flow at backend realm (discovery only — interactive via --device-flow)",
+        "curl",
+        # Probe 6 in the chain is DISCOVERY ONLY. Device flow needs the
+        # user to open a verification URL in a browser and log in there
+        # — that's interactive, can't run blocking inside the chain. So
+        # this lambda just sweeps candidate client_ids at the backend's
+        # device_authorization_endpoint, logs what's reachable, and
+        # always returns None. To actually use device flow, run the
+        # script with --device-flow.
+        lambda s, bc, em, pw, lp: (_probe_device_flow_discover(s, bc, lp), None)[1],
     ),
 ]
 
@@ -1604,6 +1991,71 @@ def _run_browser_flow(region, brand):
                 pass
 
 
+def _run_device_flow(region, brand, brand_config):
+    """
+    Interactive device-flow login at the backend Keycloak realm.
+    Triggered explicitly via --device-flow; doesn't go through the
+    automatic probe chain. The user opens a verification URI on
+    any browser, logs in there, this script polls for tokens.
+    No password is sent from this script in this mode (the user
+    enters it on Kia's official Keycloak page).
+    """
+    debug_log_path = os.path.abspath(DEBUG_LOG_FILE)
+    try:
+        with open(debug_log_path, "w", encoding="utf-8") as f:
+            f.write(
+                f"{brand_config['name']} device-flow log — "
+                f"{dt.datetime.now():%Y-%m-%d %H:%M:%S}\n"
+            )
+    except OSError:
+        pass
+
+    print(f"Device flow login for {brand['name']} ({region['name']}).")
+    print("This is an experimental path. You will log in on a verification")
+    print("URL in any browser (your phone is fine), and this script will")
+    print("pick up the tokens once you're done — no password is sent from")
+    print("this script.\n")
+
+    try:
+        from curl_cffi import requests as curl_requests  # noqa: F401
+    except ImportError as exc:
+        print(f"[ERROR] {exc}")
+        print("Re-run pip install -r requirements.txt and try again.")
+        return
+
+    s = _make_curl_cffi_session_with_ua(debug_log_path)
+    if s is None:
+        print("[ERROR] curl_cffi session could not be set up. See debug log.")
+        return
+
+    findings = _probe_device_flow_discover(s, brand_config, debug_log_path)
+    if not findings:
+        print("[ERROR] No client_id at the backend realm accepted device-flow")
+        print("initialization. The chain has no usable device-flow path right")
+        print("now. See debug log for what each candidate client returned.")
+        print(f"\nDebug log: {debug_log_path}")
+        return
+
+    # Use the first usable finding. (Could prompt user to pick if there
+    # are multiple, but in practice there'll be at most one.)
+    finding = findings[0]
+    print(f"[OK] device-flow init succeeded with client_id={finding['client_id']}.")
+    tokens = _interactive_device_flow_complete(s, finding, debug_log_path)
+    if not tokens:
+        return
+    if tokens.get("refresh_token") and tokens.get("access_token"):
+        print(
+            f"\n[OK] Your tokens (Keycloak-native — may need translation for HA):\n\n"
+            f"- Refresh Token: {tokens['refresh_token']}\n"
+            f"- Access Token:  {tokens['access_token']}\n"
+        )
+        print("NOTE: tokens issued by the backend Keycloak realm have")
+        print(f"      iss = {brand_config['backend_realm_url']}")
+        print("      whereas the CCSP API expects iss = 'uvo'. Test these")
+        print("      in Home Assistant; if they don't work, that's the")
+        print("      reason and we'd need a token-translation step.")
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Get a Kia or Hyundai OAuth2 refresh token.",
@@ -1614,12 +2066,26 @@ def main():
         action="store_true",
         help=(
             "Diagnostic mode for Kia/Hyundai EU. Runs every probe in the "
-            "fallback chain (0..5) in isolation, regardless of which one "
+            "fallback chain (0..6) in isolation, regardless of which one "
             "succeeds, and prints a PASS/FAIL summary at the end. Use this "
             "to verify that fallback paths still work (and aren't silently "
             "broken until the primary fails). Takes ~30-60 seconds and "
             "uses your credentials for every probe — may trigger Kia's "
             "rate limits if run too often."
+        ),
+    )
+    parser.add_argument(
+        "--device-flow",
+        action="store_true",
+        help=(
+            "EXPERIMENTAL Kia/Hyundai EU only: skip the regular probe chain "
+            "and try OAuth Device Flow at the backend Keycloak realm. "
+            "Sweeps candidate client_ids until one accepts a device-code "
+            "request, then prompts you to open the verification URL in any "
+            "browser and log in there. No password is sent from this "
+            "script in this mode. Tokens come from the backend realm "
+            "directly (Keycloak-native iss, may need translation for HA — "
+            "see CHANGELOG)."
         ),
     )
     parser.add_argument(
@@ -1631,6 +2097,18 @@ def main():
 
     try:
         region, brand = select_region_and_brand()
+
+        # --device-flow short-circuits the probe chain entirely.
+        if args.device_flow:
+            if region["name"] != "Europe" or brand["name"] not in ("Kia", "Hyundai"):
+                print("[NOTE] --device-flow is only implemented for Kia/Hyundai EU.")
+                return
+            brand_cfg = (
+                KIA_EU_BRAND_CONFIG if brand["name"] == "Kia"
+                else HYUNDAI_EU_BRAND_CONFIG
+            )
+            _run_device_flow(region, brand, brand_cfg)
+            return
 
         # Kia EU and Hyundai EU both go through the browserless
         # direct-API path. Other regions still use the browser flow
