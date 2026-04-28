@@ -1,4 +1,4 @@
-# KiaHyundaiToken v3.1.0
+# KiaHyundaiToken v3.1.1
 
 Get your **Kia** or **Hyundai** OAuth2 refresh token — worldwide.
 
@@ -96,6 +96,8 @@ After activating a virtual environment, always use **`python`** (not `py`). `py`
 3. The script asks you to **select your brand** (Kia or Hyundai if both available).
 4. **For Kia EU:** the script prompts for your **Kia account email and password**, talks directly to Kia's API, and prints your tokens in ~10 seconds. No browser opens.
 5. **For other regions:** a Chrome window opens. Log in normally. The script detects login, completes the OAuth flow, and prints your tokens.
+
+If the EU direct path can't get a token (e.g. an endpoint changed), the script offers a **browser-based fallback** automatically: a 5-second countdown, then Chrome opens for a manual login as a recovery path. Press Ctrl+C during the countdown to skip if you know the issue is something else (e.g. a wrong password).
 
 Copy the **Refresh Token** and store it securely.
 

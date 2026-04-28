@@ -1,3 +1,22 @@
+"""
+KiaHyundaiToken — get a Kia or Hyundai OAuth2 refresh token.
+
+Two execution paths, picked automatically by region + brand:
+  * Kia EU / Hyundai EU: browserless direct-API login. POSTs the
+    user's credentials (RSA-encrypted) to the IdP's /auth/account/signin
+    endpoint with the official mobile-app's TLS fingerprint, exchanges
+    the resulting code for tokens, validates the result. ~10 seconds.
+  * All other regions: existing Selenium-based one-time browser login.
+
+If the EU direct path fails (e.g. an IdP endpoint changes), the
+browser flow is offered as an automatic fallback so the user always
+gets at least one chance to recover.
+
+See README for usage and CHANGELOG for version history.
+"""
+
+__version__ = "3.1.1"
+
 import base64
 import datetime as dt
 import getpass
@@ -5,6 +24,7 @@ import os
 import random
 import re
 import shutil
+import time
 
 from selenium import webdriver
 from selenium.webdriver.chrome.service import Service
@@ -565,6 +585,23 @@ def _prime_session_cookies(s, brand_config, log_path):
         _direct_log(log_path, f"  [Cookie prime] exception: {e}")
 
 
+def _import_rsa():
+    """
+    Lazy-import pycryptodome's RSA + PKCS1_v1_5. Raises a clean
+    RuntimeError with install hint if the package is missing,
+    instead of an opaque ImportError traceback.
+    """
+    try:
+        from Crypto.PublicKey import RSA
+        from Crypto.Cipher import PKCS1_v1_5
+        return RSA, PKCS1_v1_5
+    except ImportError as exc:
+        raise RuntimeError(
+            "EU direct mode requires pycryptodome for password encryption. "
+            "Install it with: python -m pip install pycryptodome"
+        ) from exc
+
+
 def _fetch_signin_pubkey(s, brand_config, log_path):
     """
     Fetch the IdP's RSA public key for password encryption. The endpoint
@@ -584,14 +621,18 @@ def _fetch_signin_pubkey(s, brand_config, log_path):
     try:
         body = resp.json()
         jwk = body.get("retValue") or {}
+        if not jwk.get("n") or not jwk.get("e"):
+            _direct_log(log_path, "  [JWK fetch] missing 'n' or 'e' in retValue")
+            return None, None
         n = int.from_bytes(base64.urlsafe_b64decode(jwk["n"] + "=="), "big")
         e_val = int.from_bytes(base64.urlsafe_b64decode(jwk["e"] + "=="), "big")
-        from Crypto.PublicKey import RSA
+        RSA, _ = _import_rsa()
         key = RSA.construct((n, e_val))
         kid = jwk.get("kid", "")
         _direct_log(
             log_path,
-            f"  [JWK fetch] parsed key kid={kid} modulus_bits={n.bit_length()}",
+            f"  [JWK fetch] parsed key kid={kid or '(empty)'} "
+            f"modulus_bits={n.bit_length()}",
         )
         return key, kid
     except (ValueError, KeyError, TypeError) as exc:
@@ -601,7 +642,7 @@ def _fetch_signin_pubkey(s, brand_config, log_path):
 
 def _rsa_encrypt(public_key, plaintext):
     """PKCS#1 v1.5 RSA encrypt; return hex string (the format Kia EU expects)."""
-    from Crypto.Cipher import PKCS1_v1_5
+    _, PKCS1_v1_5 = _import_rsa()
     cipher = PKCS1_v1_5.new(public_key)
     return cipher.encrypt(plaintext.encode("utf-8")).hex()
 
@@ -741,7 +782,13 @@ def eu_direct_probe(email, password, brand_config, log_path):
     Both paths share the same code-extraction → token-exchange →
     validation pipeline.
     """
-    from curl_cffi import requests as curl_requests
+    try:
+        from curl_cffi import requests as curl_requests
+    except ImportError as exc:
+        raise RuntimeError(
+            "EU direct mode requires curl_cffi for TLS impersonation. "
+            "Install it with: python -m pip install curl_cffi"
+        ) from exc
 
     _direct_log(
         log_path,
@@ -812,7 +859,12 @@ def kia_eu_direct_probe(email, password, log_path):
 
 
 def _run_eu_direct(region, brand, brand_config):
-    """Browserless direct-API path for Kia/Hyundai EU. Prompts for credentials."""
+    """
+    Browserless direct-API path for Kia/Hyundai EU. Prompts for
+    credentials. If both direct-API paths fail, automatically falls
+    back to the marketing-client browser flow as last resort, so the
+    user always gets at least one chance to recover.
+    """
     debug_log_path = os.path.abspath(DEBUG_LOG_FILE)
     try:
         with open(debug_log_path, "w", encoding="utf-8") as f:
@@ -838,19 +890,53 @@ def _run_eu_direct(region, brand, brand_config):
         return
 
     print("\nFetching token (typically 5–15 seconds)...\n")
-    tokens = eu_direct_probe(email, password, brand_config, debug_log_path)
+    try:
+        tokens = eu_direct_probe(email, password, brand_config, debug_log_path)
+    except RuntimeError as exc:
+        # Friendly message for missing curl_cffi / pycryptodome.
+        print(f"[ERROR] {exc}")
+        print("Re-run the Quick Start to install all dependencies, then retry.")
+        return
+
     if tokens and tokens.get("refresh_token") and tokens.get("access_token"):
         print(
             f"[OK] Your tokens are:\n\n"
             f"- Refresh Token: {tokens['refresh_token']}\n"
             f"- Access Token:  {tokens['access_token']}"
         )
-    else:
-        print("[ERROR] Could not obtain tokens. Possible reasons:")
-        print("  - Wrong email or password (most likely)")
-        print(f"  - {brand['name']} changed an endpoint (rare — please open an issue)")
-        print(f"\nThe full diagnostic log is at:\n  {debug_log_path}")
-        print("Open an issue with the log contents (passwords are NOT logged).")
+        return
+
+    # ----------------------------------------------------------------
+    # Direct path failed. Walk the user through the browser fallback.
+    # The browser flow uses the marketing-client login (proven UX for
+    # solving any captcha) and then attempts the CCSP authorize
+    # handoff. The handoff is currently anti-bot-blocked for many EU
+    # users, but if the user's IP/account isn't on the block list (or
+    # if Kia has loosened the rule), this is their automatic recovery.
+    # ----------------------------------------------------------------
+    print("[ERROR] Could not obtain tokens via the direct API. Reasons in")
+    print("order of likelihood:")
+    print("  - Wrong email or password (most common — re-check)")
+    print(f"  - {brand['name']} changed an endpoint (rare)")
+    print(f"\nDiagnostic log: {debug_log_path}")
+    print("(Passwords are not logged.)\n")
+
+    print("=" * 60)
+    print("FALLBACK: trying the browser-based flow as a last resort.")
+    print("This will open Chrome and let you log in there. Useful if")
+    print("the typo theory is wrong and an endpoint changed. Press")
+    print("Ctrl+C now to skip the browser fallback.")
+    print("=" * 60)
+    try:
+        for remaining in (5, 4, 3, 2, 1):
+            print(f"  Opening Chrome in {remaining}s...", end="\r", flush=True)
+            time.sleep(1)
+        print(" " * 40, end="\r")  # clear the countdown line
+    except KeyboardInterrupt:
+        print("\n\nFallback skipped. Run the script again to retry.")
+        return
+
+    _run_browser_flow(region, brand)
 
 
 def _run_browser_flow(region, brand):

@@ -1,5 +1,30 @@
 # Changelog
 
+## [3.1.1] - 2026-04-27
+
+### Added
+- **Automatic browser fallback when the EU direct path fails.** If
+  both the app-flow and legacy-signin paths return no tokens, the
+  script announces the failure, gives the user a 5-second countdown
+  to skip with Ctrl+C, then opens Chrome and runs the marketing-
+  client login flow as a recovery path. Useful when an endpoint
+  changes (the typo theory is wrong) — at least one chance to log
+  in before giving up.
+- Module-level docstring describing the dual execution paths.
+- `__version__` constant.
+- Friendly `RuntimeError` with `pip install` hint when `curl_cffi`
+  or `pycryptodome` is missing, instead of a raw `ImportError`
+  traceback. Wrapped at the call site in `_run_eu_direct` so the
+  user sees a clean error message.
+- Defensive check in `_fetch_signin_pubkey`: explicitly returns
+  `(None, None)` when the JWK response is missing the `n` or `e`
+  field, instead of relying on a generic exception catch later.
+
+### Fixed
+- `_fetch_signin_pubkey` now logs `kid=(empty)` instead of an
+  empty string when the IdP returns a JWK without a key ID
+  (cosmetic).
+
 ## [3.1.0] - 2026-04-27
 
 ### Added
