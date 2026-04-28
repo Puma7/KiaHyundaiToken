@@ -1,5 +1,58 @@
 # Changelog
 
+## [3.2.0] - 2026-04-27
+
+### Added
+- **Five-stage fallback chain for the EU direct path.** If one
+  endpoint changes or one path gets blocked, the next one takes
+  over automatically. Each probe is logged in detail, so a future
+  break is easy to diagnose:
+  1. **App-flow** — RSA-encrypted password at /auth/account/signin
+     with the CCSP client_id (current primary, what the mobile app
+     does). Unchanged from v3.1.x.
+  2. **Legacy signin** — plaintext password at /auth/account/signin
+     with the CCSP client_id. Defensive fallback.
+  3. **Marketing → CCSP via cookie reuse** — sign in with the
+     marketing OAuth client (kia.com online-sales / Hyundai
+     hyundai-europe), then GET the WAF-protected CCSP authorize
+     endpoint on the same curl_cffi session. The aws-waf-token
+     cookie issued during marketing signin may persuade the WAF
+     to let the second request through. Tries both normal and
+     `prompt=none` (silent SSO) variants.
+  4. **OIDC discovery + ROPC** — fetches /.well-known/openid-
+     configuration. If discovery advertises grant_types_supported
+     that includes "password", attempts ROPC at the advertised
+     token_endpoint. Even when ROPC isn't supported, the discovery
+     dump in the debug log reveals new endpoints if Kia adds them.
+  5. **Backend Keycloak realm at eu-account.kia.com** — the JWT
+     issued by the public IdP fassade has `iss` pointing here. If
+     the backend realm is reachable from the public internet (and
+     accepts ROPC), this is a clean fully-headless path completely
+     independent of the WAF-protected fassade. Speculative; the
+     `device_authorization_endpoint` value (if advertised) is
+     also captured for a possible future device-flow probe.
+
+  All five probes share a curl_cffi session, randomized User-Agent,
+  and randomized TLS impersonation profile. Cookies persist across
+  probes within a single run.
+
+### Changed
+- `eu_direct_probe` now writes a section header for each probe
+  (Probe 1 / Probe 2 / …) into the debug log so the chain is easy
+  to follow when troubleshooting.
+- Probe 3+ are skipped gracefully when their per-brand config
+  fields are missing (e.g. a future brand without
+  `marketing_client_id` set).
+
+### Notes
+- **Probes 3, 4, 5 are speculative as of this release** — they
+  haven't been validated against a real Kia/Hyundai EU account
+  because Probes 1+2 are still working. They'll start mattering
+  the day Kia changes something. Whichever fires first will tell
+  us what Kia changed and which path survived.
+- The browser-based fallback (v3.1.1) still kicks in when all
+  five direct probes return None.
+
 ## [3.1.1] - 2026-04-27
 
 ### Added

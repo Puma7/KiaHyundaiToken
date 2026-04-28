@@ -15,7 +15,7 @@ gets at least one chance to recover.
 See README for usage and CHANGELOG for version history.
 """
 
-__version__ = "3.1.1"
+__version__ = "3.2.0"
 
 import base64
 import datetime as dt
@@ -483,6 +483,17 @@ KIA_EU_BRAND_CONFIG = {
     "client_secret": "secret",
     "redirect_uri": "https://prd.eu-ccapi.kia.com:8080/api/v1/user/oauth2/redirect",
     "token_url": "https://idpconnect-eu.kia.com/auth/api/v2/user/oauth2/token",
+    # Marketing client used by Probe 3 (cookie-priming via the kia.com
+    # online-sales OAuth client). Same IdP host but a different OAuth
+    # client; signin against this client returns a code redirected to
+    # kia.com — discarded — but the IdP session cookies stay on the
+    # session and let us then attempt the CCSP authorize endpoint.
+    "marketing_client_id": "peukiaidm-online-sales",
+    "marketing_redirect_uri": "https://www.kia.com/api/bin/oneid/login",
+    # Backend realm host for Probe 5 (Keycloak realm hidden behind the
+    # public-facing IdP fassade). Sourced from the JWT iss field of
+    # tokens issued by Probes 1-3.
+    "backend_realm_url": "https://eu-account.kia.com/auth/realms/eukiaidm",
 }
 
 HYUNDAI_EU_BRAND_CONFIG = {
@@ -495,6 +506,12 @@ HYUNDAI_EU_BRAND_CONFIG = {
     # Hyundai redirect ends in /token, Kia ends in /redirect — gotcha.
     "redirect_uri": "https://prd.eu-ccapi.hyundai.com:8080/api/v1/user/oauth2/token",
     "token_url": "https://idpconnect-eu.hyundai.com/auth/api/v2/user/oauth2/token",
+    "marketing_client_id": "peuhyundaiidm-ctb",
+    "marketing_redirect_uri": "https://ctbapi.hyundai-europe.com/api/auth",
+    # Mirror of the Kia backend-realm naming convention; not yet
+    # confirmed against a Hyundai JWT iss field, so Probe 5 may
+    # NXDOMAIN here. Logged as "no result" if so.
+    "backend_realm_url": "https://eu-account.hyundai.com/auth/realms/euhyundaiidm",
 }
 
 # Pool of Android/iOS TLS impersonation profiles for curl_cffi. Picked
@@ -736,6 +753,292 @@ def _form_signin_legacy(s, brand_config, email, password, log_path):
     return None
 
 
+# ---------------------------------------------------------------------------
+# Probe 3: marketing-client signin → CCSP authorize on the same session
+#
+# Theory: AWS WAF Bot Control issues an `aws-waf-token` cookie when a
+# session passes its initial challenge. The marketing-client signin
+# endpoint isn't WAF-blocked, so we successfully receive that cookie
+# during the marketing POST. If we then hit the WAF-blocked CCSP
+# authorize endpoint with the SAME curl_cffi session — same TLS
+# fingerprint, same WAF token, same KEYCLOAK_IDENTITY cookies set
+# during signin — WAF may treat it as a continuation of an already-
+# trusted session and let it through. Worst case: WAF ignores the
+# token, redirects to /error, and we just return None.
+# ---------------------------------------------------------------------------
+def _probe_marketing_to_ccsp(s, brand_config, email, password, log_path):
+    """
+    Sign in via the marketing OAuth client to seed cookies, then use
+    the same session to GET the CCSP authorize endpoint. Returns a
+    CCSP authorization code on success, or None.
+    """
+    if not brand_config.get("marketing_client_id"):
+        _direct_log(log_path, "  [Probe 3] no marketing_client_id configured, skipping.")
+        return None
+
+    # Step 1: marketing signin (NOT WAF-blocked) — we just want the cookies.
+    signin_url = f"{brand_config['host']}/auth/account/signin"
+    signin_data = {
+        "client_id": brand_config["marketing_client_id"],
+        "encryptedPassword": "false",
+        "username": email,
+        "password": password,
+        "redirect_uri": brand_config["marketing_redirect_uri"],
+        "state": "ccsp",
+        "remember_me": "false",
+    }
+    _direct_log(log_path, f"\n  [Probe 3 — Marketing signin] POST {signin_url}")
+    try:
+        resp = s.post(signin_url, data=signin_data, timeout=30, allow_redirects=False)
+    except Exception as exc:
+        _direct_log(log_path, f"  [Probe 3 signin] network error: {exc}")
+        return None
+    _log_response(log_path, "Probe 3 — Marketing signin", resp)
+    if resp.status_code not in (302, 303):
+        _direct_log(log_path, "  [Probe 3] marketing signin failed (likely bad creds), aborting.")
+        return None
+
+    # Now we have IdP session cookies + aws-waf-token on the session.
+    # Try the CCSP authorize URL — first normally, then with prompt=none
+    # (silent SSO; some WAFs whitelist this because it's machine-to-
+    # machine by design).
+    ccsp_authorize_base = (
+        f"{brand_config['host']}/auth/api/v2/user/oauth2/authorize"
+        f"?response_type=code&client_id={brand_config['client_id']}"
+        f"&redirect_uri={brand_config['redirect_uri']}"
+        "&lang=en&state=ccsp"
+    )
+
+    for label, url in (
+        ("Probe 3 — CCSP authorize", ccsp_authorize_base),
+        ("Probe 3 — CCSP authorize (prompt=none)", ccsp_authorize_base + "&prompt=none"),
+    ):
+        _direct_log(log_path, f"\n  [{label}] GET {url}")
+        try:
+            resp = s.get(url, timeout=30, allow_redirects=False)
+        except Exception as exc:
+            _direct_log(log_path, f"  [{label}] network error: {exc}")
+            continue
+        _log_response(log_path, label, resp)
+        if resp.status_code in (302, 303):
+            location = resp.headers.get("Location", "")
+            match = re.search(r"[?&]code=([^&]+)", location)
+            if match:
+                _direct_log(log_path, f"  [{label}] got CCSP code via cookie reuse.")
+                return match.group(1)
+            if "/error" in location or "error=" in location:
+                _direct_log(log_path, f"  [{label}] WAF-blocked (redirect to error).")
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Probe 4: OIDC discovery + ROPC against advertised endpoints
+#
+# Most OAuth/OIDC providers expose a metadata document at
+# /.well-known/openid-configuration listing all supported endpoints
+# and grant types. If discovery advertises grant_types_supported
+# including "password", we get a free-of-charge ROPC attempt at the
+# advertised token_endpoint. Even when ROPC isn't supported, the
+# discovery dump goes into the debug log and is invaluable next time
+# Kia adds or moves an endpoint — we'll see it immediately instead of
+# guessing.
+# ---------------------------------------------------------------------------
+def _probe_oidc_discovery(s, brand_config, email, password, log_path):
+    """
+    Fetch /.well-known/openid-configuration and try ROPC at any
+    advertised token endpoint that supports grant_type=password.
+    Returns a token dict on success, None otherwise. (Returns full
+    tokens directly because OIDC ROPC bypasses the code-exchange
+    step entirely.)
+    """
+    discovery_url = f"{brand_config['host']}/.well-known/openid-configuration"
+    _direct_log(log_path, f"\n  [Probe 4 — OIDC discovery] GET {discovery_url}")
+    try:
+        resp = s.get(discovery_url, timeout=30)
+    except Exception as exc:
+        _direct_log(log_path, f"  [Probe 4 discovery] network error: {exc}")
+        return None
+    if resp.status_code != 200:
+        _log_response(log_path, "Probe 4 discovery", resp)
+        return None
+    try:
+        config = resp.json()
+    except ValueError:
+        _direct_log(log_path, "  [Probe 4 discovery] body not JSON")
+        return None
+
+    # Log everything interesting about what Kia advertises.
+    interesting_keys = (
+        "issuer",
+        "authorization_endpoint",
+        "token_endpoint",
+        "device_authorization_endpoint",
+        "userinfo_endpoint",
+        "introspection_endpoint",
+        "revocation_endpoint",
+        "end_session_endpoint",
+        "jwks_uri",
+        "grant_types_supported",
+        "response_types_supported",
+        "scopes_supported",
+        "token_endpoint_auth_methods_supported",
+    )
+    _direct_log(log_path, "  [Probe 4 discovery] advertised metadata:")
+    for key in interesting_keys:
+        if key in config:
+            _direct_log(log_path, f"    {key}: {_safe_truncate(config[key], 200)}")
+
+    if config.get("device_authorization_endpoint"):
+        _direct_log(
+            log_path,
+            "  [Probe 4 discovery] device_authorization_endpoint present — "
+            "future feature: implement device-flow login.",
+        )
+
+    grant_types = config.get("grant_types_supported", []) or []
+    token_endpoint = config.get("token_endpoint")
+    if not token_endpoint or "password" not in grant_types:
+        _direct_log(
+            log_path,
+            "  [Probe 4 discovery] ROPC not advertised (or no token_endpoint), nothing to try.",
+        )
+        return None
+
+    # Discovery says ROPC is supported. Attempt it.
+    _direct_log(
+        log_path,
+        f"\n  [Probe 4 — ROPC] POST {token_endpoint} grant_type=password",
+    )
+    try:
+        resp = s.post(
+            token_endpoint,
+            data={
+                "grant_type": "password",
+                "username": email,
+                "password": password,
+                "client_id": brand_config["client_id"],
+                "client_secret": brand_config["client_secret"],
+                "scope": "openid profile email phone",
+            },
+            timeout=30,
+        )
+    except Exception as exc:
+        _direct_log(log_path, f"  [Probe 4 ROPC] network error: {exc}")
+        return None
+    _log_response(log_path, "Probe 4 ROPC", resp)
+    if resp.status_code != 200:
+        return None
+    try:
+        tokens = resp.json()
+    except ValueError:
+        return None
+    if tokens.get("refresh_token") and tokens.get("access_token"):
+        return tokens
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Probe 5: direct Keycloak realm at eu-account.kia.com
+#
+# The JWT issued by the public IdP fassade has `iss` =
+# "https://eu-account.kia.com/auth/realms/eukiaidm". That's the actual
+# Keycloak server behind the fassade. AWS WAF protects the fassade
+# (idpconnect-eu.kia.com), but if the backend realm is also reachable
+# from the public internet (which it must be, otherwise no one could
+# verify JWT issuer URLs), it may not have the same WAF rules — the
+# WAF is typically configured per host. Try Keycloak's standard
+# OIDC endpoints there. Speculative and not in any prior open-source
+# implementation; if it works, it's a clean fully-headless path
+# completely independent of the WAF-protected fassade.
+# ---------------------------------------------------------------------------
+def _probe_backend_realm(s, brand_config, email, password, log_path):
+    """
+    Hit the backend Keycloak realm at eu-account.kia.com directly.
+    Try (a) discovery to confirm reachability, (b) ROPC token grant.
+    Returns a token dict on success, None otherwise.
+    """
+    realm_url = brand_config.get("backend_realm_url")
+    if not realm_url:
+        _direct_log(log_path, "  [Probe 5] no backend_realm_url configured, skipping.")
+        return None
+
+    discovery_url = f"{realm_url}/.well-known/openid-configuration"
+    _direct_log(log_path, f"\n  [Probe 5 — Backend realm discovery] GET {discovery_url}")
+    try:
+        resp = s.get(discovery_url, timeout=15)
+    except Exception as exc:
+        _direct_log(
+            log_path,
+            f"  [Probe 5 discovery] network error: {exc} "
+            "(backend realm may not be public-facing — expected for some setups)",
+        )
+        return None
+    if resp.status_code != 200:
+        _log_response(log_path, "Probe 5 discovery", resp)
+        return None
+
+    try:
+        config = resp.json()
+    except ValueError:
+        _direct_log(log_path, "  [Probe 5 discovery] body not JSON")
+        return None
+
+    _direct_log(log_path, "  [Probe 5 discovery] backend realm REACHABLE — metadata:")
+    for key in (
+        "issuer",
+        "token_endpoint",
+        "authorization_endpoint",
+        "grant_types_supported",
+        "token_endpoint_auth_methods_supported",
+    ):
+        if key in config:
+            _direct_log(log_path, f"    {key}: {_safe_truncate(config[key], 200)}")
+
+    token_endpoint = config.get("token_endpoint")
+    if not token_endpoint:
+        return None
+
+    grant_types = config.get("grant_types_supported", []) or []
+    if "password" not in grant_types:
+        _direct_log(
+            log_path,
+            "  [Probe 5] backend realm doesn't advertise ROPC, nothing more to try.",
+        )
+        return None
+
+    _direct_log(
+        log_path,
+        f"\n  [Probe 5 — Backend ROPC] POST {token_endpoint} grant_type=password",
+    )
+    try:
+        resp = s.post(
+            token_endpoint,
+            data={
+                "grant_type": "password",
+                "username": email,
+                "password": password,
+                "client_id": brand_config["client_id"],
+                "client_secret": brand_config["client_secret"],
+                "scope": "openid profile email phone",
+            },
+            timeout=30,
+        )
+    except Exception as exc:
+        _direct_log(log_path, f"  [Probe 5 ROPC] network error: {exc}")
+        return None
+    _log_response(log_path, "Probe 5 ROPC", resp)
+    if resp.status_code != 200:
+        return None
+    try:
+        tokens = resp.json()
+    except ValueError:
+        return None
+    if tokens.get("refresh_token") and tokens.get("access_token"):
+        _direct_log(log_path, "  [Probe 5] backend-realm ROPC SUCCEEDED — clean WAF-bypass path.")
+        return tokens
+    return None
+
+
 def _validate_refresh_token(refresh_token, brand_config, log_path):
     """
     Confirm the freshly-minted refresh_token actually mints a new
@@ -772,15 +1075,32 @@ def eu_direct_probe(email, password, brand_config, log_path):
     Browserless login for Kia or Hyundai EU. Returns a token dict
     (with refresh_token + access_token) on success, None on failure.
 
-    Strategy:
-      1. App-flow with cookie priming + RSA-encrypted password (what
-         the official mobile app does — most app-like, future-proof
-         against `encryptedPassword=true` ever becoming required).
-      2. Legacy un-encrypted signin as a defensive fallback (still
-         works today; first to break if Kia tightens).
+    Probe order, cheap-and-most-likely first:
 
-    Both paths share the same code-extraction → token-exchange →
-    validation pipeline.
+      1. App-flow      — RSA-encrypted password + CCSP client_id at
+                         /auth/account/signin. What the official
+                         mobile app does. Currently the working path.
+      2. Legacy        — Plaintext password + CCSP client_id at
+                         /auth/account/signin (encryptedPassword=false).
+                         Defensive fallback — first to break if Kia
+                         tightens.
+      3. Marketing→CCSP — Marketing-client signin to seed cookies +
+                         aws-waf-token, then GET CCSP authorize on
+                         the same curl_cffi session. Bets that WAF
+                         lets a session through once it's already
+                         passed a challenge. Try with prompt=none too.
+      4. OIDC discovery — GET /.well-known/openid-configuration. If
+                         it advertises grant_type=password, attempt
+                         ROPC at the advertised token_endpoint.
+                         Useful if Kia ever adds a new endpoint.
+      5. Backend realm — Direct ROPC against eu-account.kia.com's
+                         Keycloak realm (the host in JWT iss). Only
+                         works if the backend is publicly reachable
+                         and accepts ROPC.
+
+    Probes 1-3 produce a code that we exchange for tokens; probes 4-5
+    produce tokens directly via OIDC ROPC. All successful paths run
+    the same validation step before returning.
     """
     try:
         from curl_cffi import requests as curl_requests
@@ -813,12 +1133,18 @@ def eu_direct_probe(email, password, brand_config, log_path):
         "User-Agent": chosen_ua,
     })
 
-    def _try_path(path_name, code_getter):
-        code = code_getter()
+    def _finalize_with_code(path_name, code):
+        """Exchange code for tokens, validate, return tokens or None."""
         if not code:
             return None
         _direct_log(log_path, f"  [{path_name}] got code, exchanging for tokens…")
         tokens = _exchange_code_for_tokens(s, code, brand_config, log_path)
+        if not (tokens and tokens.get("refresh_token") and tokens.get("access_token")):
+            return None
+        return _finalize_with_tokens(path_name, tokens)
+
+    def _finalize_with_tokens(path_name, tokens):
+        """Validate tokens, return them on success (or warn-and-return on validation fail)."""
         if not (tokens and tokens.get("refresh_token") and tokens.get("access_token")):
             return None
         if _validate_refresh_token(tokens["refresh_token"], brand_config, log_path):
@@ -831,24 +1157,48 @@ def eu_direct_probe(email, password, brand_config, log_path):
         )
         return tokens
 
-    # Path 1: app-flow (modern, RSA-encrypted)
-    result = _try_path(
-        "App-flow",
-        lambda: _form_signin_app_flow(s, brand_config, email, password, log_path),
+    # Probe 1: app-flow (modern, RSA-encrypted, CCSP client)
+    _direct_log(log_path, "\n--- Probe 1: App-flow signin (RSA-encrypted) ---")
+    result = _finalize_with_code(
+        "Probe 1 / App-flow",
+        _form_signin_app_flow(s, brand_config, email, password, log_path),
     )
     if result:
         return result
 
-    # Path 2: legacy un-encrypted signin (defensive fallback)
-    _direct_log(log_path, "\n  Falling back to legacy un-encrypted signin path.")
-    result = _try_path(
-        "Legacy",
-        lambda: _form_signin_legacy(s, brand_config, email, password, log_path),
+    # Probe 2: legacy un-encrypted signin (CCSP client, plaintext)
+    _direct_log(log_path, "\n--- Probe 2: Legacy signin (plaintext) ---")
+    result = _finalize_with_code(
+        "Probe 2 / Legacy",
+        _form_signin_legacy(s, brand_config, email, password, log_path),
     )
     if result:
         return result
 
-    _direct_log(log_path, "\n=== All paths exhausted, no token obtained ===\n")
+    # Probe 3: marketing-cookie reuse on the same curl_cffi session
+    _direct_log(log_path, "\n--- Probe 3: Marketing → CCSP via cookie reuse ---")
+    result = _finalize_with_code(
+        "Probe 3 / Marketing→CCSP",
+        _probe_marketing_to_ccsp(s, brand_config, email, password, log_path),
+    )
+    if result:
+        return result
+
+    # Probe 4: OIDC discovery + ROPC at advertised endpoint
+    _direct_log(log_path, "\n--- Probe 4: OIDC discovery + ROPC ---")
+    tokens = _probe_oidc_discovery(s, brand_config, email, password, log_path)
+    result = _finalize_with_tokens("Probe 4 / OIDC discovery", tokens)
+    if result:
+        return result
+
+    # Probe 5: direct backend Keycloak realm
+    _direct_log(log_path, "\n--- Probe 5: Backend realm (eu-account.*) direct ROPC ---")
+    tokens = _probe_backend_realm(s, brand_config, email, password, log_path)
+    result = _finalize_with_tokens("Probe 5 / Backend realm", tokens)
+    if result:
+        return result
+
+    _direct_log(log_path, "\n=== All 5 probes exhausted, no token obtained ===\n")
     return None
 
 
