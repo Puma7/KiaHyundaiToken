@@ -15,7 +15,7 @@ gets at least one chance to recover.
 See README for usage and CHANGELOG for version history.
 """
 
-__version__ = "3.2.0"
+__version__ = "3.2.1"
 
 import base64
 import datetime as dt
@@ -514,16 +514,21 @@ HYUNDAI_EU_BRAND_CONFIG = {
     "backend_realm_url": "https://eu-account.hyundai.com/auth/realms/euhyundaiidm",
 }
 
-# Pool of Android/iOS TLS impersonation profiles for curl_cffi. Picked
-# at random per run so consecutive script runs don't all share the
-# same TLS fingerprint at the IdP. Only mobile profiles — that's what
-# the official Connect app sends, so it's what the IdP expects.
+# Pool of TLS impersonation profiles for curl_cffi. We keep this list
+# to widely-supported baseline profiles (no `_android` suffix) because
+# specific mobile/version variants only exist in some curl_cffi build
+# combinations. The Windows wheel of curl_cffi 0.15.0, for example,
+# rejects `chrome124_android` even though Linux 0.15.0 accepts it.
+# `chrome` is the safest — it's an alias for "latest available" and
+# always present.
 TLS_IMPERSONATE_POOL = [
-    "chrome131_android",
-    "chrome124_android",
-    "chrome120_android",
+    "chrome",
+    "chrome131",
+    "chrome124",
+    "chrome120",
+    "chrome116",
+    "safari17_0",
     "safari17_2_ios",
-    "safari17_0_ios",
 ]
 
 
@@ -1039,6 +1044,103 @@ def _probe_backend_realm(s, brand_config, email, password, log_path):
     return None
 
 
+# ---------------------------------------------------------------------------
+# Probe 0: plain `requests` + plaintext signin (the v3.0.0 method)
+#
+# This is the first thing we try, because it is the same code path
+# that demonstrably worked end-to-end against a real Kia EU account
+# (commit 2eed503). It uses the stdlib HTTP stack — no curl_cffi, no
+# RSA, no cookie priming — so it is immune to packaging weirdness
+# (e.g. the Windows wheel of curl_cffi 0.15.0 not containing the
+# `_android` impersonation profiles). If Kia hardens the signin
+# endpoint to require encryptedPassword=true or stricter TLS, this
+# probe is the first to break and the curl_cffi-based probes 1-5
+# pick up.
+# ---------------------------------------------------------------------------
+def _probe_plain_signin(brand_config, email, password, log_path):
+    """
+    Probe 0: plain stdlib requests, plaintext signin at
+    /auth/account/signin with the CCSP client_id. Returns a token
+    dict (already validated) on success, None on failure.
+    """
+    s = requests.Session()
+    s.headers.update({
+        "Accept-Encoding": "gzip",
+        "User-Agent": random.choice(BROWSER_UA_POOL),
+    })
+
+    code = _form_signin_legacy(s, brand_config, email, password, log_path)
+    if not code:
+        return None
+    _direct_log(log_path, "  [Probe 0] got code, exchanging for tokens…")
+    tokens = _exchange_code_for_tokens(s, code, brand_config, log_path)
+    if not (tokens and tokens.get("refresh_token") and tokens.get("access_token")):
+        return None
+    if _validate_refresh_token(tokens["refresh_token"], brand_config, log_path):
+        _direct_log(log_path, "  [JACKPOT] Probe 0 tokens validated.")
+    else:
+        _direct_log(
+            log_path,
+            "  [WARN] Probe 0 got tokens but validation failed — "
+            "returning anyway (may still work in Home Assistant).",
+        )
+    return tokens
+
+
+def _create_curl_cffi_session(log_path):
+    """
+    Create a curl_cffi Session with TLS impersonation, trying the
+    preferred profiles in random order and falling back to no-
+    impersonation if none work on this build. Returns (session,
+    profile_name).
+
+    Some curl_cffi builds (notably the Windows wheel of 0.15.0)
+    only ship a subset of impersonation profiles. To detect which
+    profiles work without spending a real network round-trip, we
+    use the fact that `Session(impersonate=...)` itself accepts
+    any name but the underlying request raises only on first use.
+    So we issue a tiny throwaway HEAD against a known-up host
+    (kia.com, which is unrelated to the IdP and won't itself flag
+    anything) before returning.
+    """
+    from curl_cffi import requests as curl_requests
+
+    profiles = list(TLS_IMPERSONATE_POOL)
+    random.shuffle(profiles)
+    profiles.append(None)  # last-resort: no impersonation
+
+    for profile in profiles:
+        try:
+            if profile is None:
+                s = curl_requests.Session()
+            else:
+                s = curl_requests.Session(impersonate=profile)
+            # Validate the profile actually works on this build.
+            s.head("https://www.kia.com/", timeout=10, allow_redirects=False)
+            label = profile or "(none)"
+            _direct_log(log_path, f"TLS profile (active): {label}")
+            return s, label
+        except Exception as exc:
+            err = str(exc)
+            if "Impersonating" in err and "not supported" in err:
+                _direct_log(log_path, f"  TLS profile {profile} not supported on this build, trying next")
+                continue
+            # Any other error (DNS, transient network) — the profile
+            # is fine, the network blip is unrelated. Use this session.
+            label = profile or "(none)"
+            _direct_log(
+                log_path,
+                f"TLS profile (active): {label}  "
+                f"(probe HEAD got {err[:80]} — that's fine, profile works)",
+            )
+            return s, label
+
+    raise RuntimeError(
+        "Could not create any curl_cffi session — every impersonation "
+        "profile rejected by this curl_cffi build."
+    )
+
+
 def _validate_refresh_token(refresh_token, brand_config, log_path):
     """
     Confirm the freshly-minted refresh_token actually mints a new
@@ -1075,41 +1177,34 @@ def eu_direct_probe(email, password, brand_config, log_path):
     Browserless login for Kia or Hyundai EU. Returns a token dict
     (with refresh_token + access_token) on success, None on failure.
 
-    Probe order, cheap-and-most-likely first:
+    Probe order, battle-tested first:
 
-      1. App-flow      — RSA-encrypted password + CCSP client_id at
-                         /auth/account/signin. What the official
-                         mobile app does. Currently the working path.
-      2. Legacy        — Plaintext password + CCSP client_id at
-                         /auth/account/signin (encryptedPassword=false).
-                         Defensive fallback — first to break if Kia
-                         tightens.
+      0. Plain signin   — stdlib `requests`, plaintext password,
+                         CCSP client_id at /auth/account/signin.
+                         The same code that worked end-to-end against
+                         a real account. Immune to curl_cffi packaging
+                         issues (e.g. Windows wheels missing some
+                         impersonation profiles).
+      1. App-flow      — RSA-encrypted password + CCSP client_id via
+                         curl_cffi with TLS impersonation. What the
+                         official mobile app does.
+      2. Legacy        — Plaintext password + CCSP client_id via
+                         curl_cffi (mirrors Probe 0 but with mobile
+                         TLS fingerprint).
       3. Marketing→CCSP — Marketing-client signin to seed cookies +
                          aws-waf-token, then GET CCSP authorize on
-                         the same curl_cffi session. Bets that WAF
-                         lets a session through once it's already
-                         passed a challenge. Try with prompt=none too.
+                         the same curl_cffi session. Try with
+                         prompt=none too.
       4. OIDC discovery — GET /.well-known/openid-configuration. If
                          it advertises grant_type=password, attempt
                          ROPC at the advertised token_endpoint.
-                         Useful if Kia ever adds a new endpoint.
       5. Backend realm — Direct ROPC against eu-account.kia.com's
-                         Keycloak realm (the host in JWT iss). Only
-                         works if the backend is publicly reachable
-                         and accepts ROPC.
+                         Keycloak realm.
 
-    Probes 1-3 produce a code that we exchange for tokens; probes 4-5
+    Probes 0-3 produce a code that we exchange for tokens; probes 4-5
     produce tokens directly via OIDC ROPC. All successful paths run
     the same validation step before returning.
     """
-    try:
-        from curl_cffi import requests as curl_requests
-    except ImportError as exc:
-        raise RuntimeError(
-            "EU direct mode requires curl_cffi for TLS impersonation. "
-            "Install it with: python -m pip install curl_cffi"
-        ) from exc
-
     _direct_log(
         log_path,
         f"\n=== {brand_config['name']} Direct API Probe — "
@@ -1117,17 +1212,39 @@ def eu_direct_probe(email, password, brand_config, log_path):
     )
     _direct_log(log_path, f"Email: {email}")
 
-    # Per-run randomization across two axes:
-    # - Browser User-Agent (15 plausible UAs)
-    # - TLS impersonation profile (5 mobile-app-shaped profiles)
-    # Different per-run combinations stop trivial cluster-fingerprinting
-    # of "all requests from this tool look identical".
-    chosen_ua = random.choice(BROWSER_UA_POOL)
-    chosen_tls = random.choice(TLS_IMPERSONATE_POOL)
-    _direct_log(log_path, f"User-Agent:  {chosen_ua}")
-    _direct_log(log_path, f"TLS profile: {chosen_tls}")
+    # ----------------------------------------------------------------
+    # Probe 0: stdlib requests, plaintext signin. Always tried first.
+    # ----------------------------------------------------------------
+    _direct_log(log_path, "\n--- Probe 0: Plain stdlib signin (v3.0 method) ---")
+    try:
+        result = _probe_plain_signin(brand_config, email, password, log_path)
+    except Exception as exc:
+        _direct_log(log_path, f"  [Probe 0] unexpected error: {exc}")
+        result = None
+    if result:
+        return result
 
-    s = curl_requests.Session(impersonate=chosen_tls)
+    # ----------------------------------------------------------------
+    # Probes 1-5 use curl_cffi with TLS impersonation. Set up a single
+    # session for them (cookies persist across probes within one run).
+    # ----------------------------------------------------------------
+    try:
+        from curl_cffi import requests as curl_requests  # noqa: F401
+    except ImportError as exc:
+        raise RuntimeError(
+            "EU direct mode requires curl_cffi for TLS impersonation. "
+            "Install it with: python -m pip install curl_cffi"
+        ) from exc
+
+    chosen_ua = random.choice(BROWSER_UA_POOL)
+    _direct_log(log_path, f"\nUser-Agent for curl_cffi probes: {chosen_ua}")
+    try:
+        s, _ = _create_curl_cffi_session(log_path)
+    except RuntimeError as exc:
+        _direct_log(log_path, f"  [curl_cffi setup] {exc}")
+        _direct_log(log_path, "\n=== curl_cffi unusable on this build, only Probe 0 was tried ===\n")
+        return None
+
     s.headers.update({
         "Accept-Encoding": "gzip",
         "User-Agent": chosen_ua,

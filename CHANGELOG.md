@@ -1,5 +1,35 @@
 # Changelog
 
+## [3.2.1] - 2026-04-28
+
+### Fixed
+- **v3.2.0 was broken on Windows because the curl_cffi 0.15.0
+  Windows wheel does not contain the `_android` impersonation
+  profiles** (`chrome131_android`, `chrome124_android`, etc.) —
+  every probe failed with `"Impersonating chrome124_android is
+  not supported"` and the user got no tokens despite valid
+  credentials. Two fixes:
+
+  1. **Probe 0 added at the start of the chain**: stdlib `requests`
+     + plaintext signin at `/auth/account/signin` with the CCSP
+     `client_id`. This is the same code path that worked end-to-end
+     in v3.0.0 against a real Kia EU account, and it does not depend
+     on curl_cffi at all. So even when the curl_cffi build is broken,
+     the script still gets a token.
+  2. **TLS impersonation profile fallback**: when a curl_cffi profile
+     is unsupported by the local build, `_create_curl_cffi_session`
+     now tries the next profile, and the next, ending at no-
+     impersonation as a last resort. Profile validity is checked with
+     a single trivial HEAD request to kia.com before returning the
+     session.
+
+### Changed
+- `TLS_IMPERSONATE_POOL` cleaned up: dropped all `_android` and `_ios`
+  variants in favor of widely-supported baseline profiles (`chrome`,
+  `chrome131`, `chrome124`, `chrome120`, `chrome116`, `safari17_0`,
+  `safari17_2_ios`). The `chrome` alias always picks the latest
+  available profile in any curl_cffi build.
+
 ## [3.2.0] - 2026-04-27
 
 ### Added
