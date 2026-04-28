@@ -1,5 +1,52 @@
 # Changelog
 
+## [3.3.0] - 2026-04-28
+
+### Added
+- **`--debug-all-probes` CLI flag** for Kia/Hyundai EU. Runs every
+  probe in the fallback chain (0..5) regardless of which one
+  succeeds, each in its own isolated curl_cffi session, and prints a
+  PASS/FAIL summary at the end. The point: the fallback chain only
+  gives us future-proofness if it actually still works. Without this
+  flag, only the first-successful probe (currently always Probe 0)
+  is exercised, and probes 1-5 could silently break without anyone
+  noticing until Kia changes the primary path. Run this occasionally
+  to confirm the chain is intact.
+
+  Usage: `python get_token.py --debug-all-probes`
+
+  Output example (terminal, in addition to the per-probe entries
+  in `kia_debug.log`):
+  ```
+  ============================================================
+  DEBUG-ALL probe results
+  ============================================================
+    Probe 0: [PASS]  Plain stdlib signin (v3.0 method)
+    Probe 1: [PASS]  App-flow (curl_cffi + RSA-encrypted password)
+    Probe 2: [PASS]  Legacy (curl_cffi + plaintext signin)
+    Probe 3: [FAIL]  Marketing → CCSP via cookie reuse
+    Probe 4: [FAIL]  OIDC discovery + ROPC
+    Probe 5: [FAIL]  Backend Keycloak realm direct ROPC
+  ============================================================
+  ```
+
+  Each probe runs with a **fresh curl_cffi session** in debug mode
+  to avoid Probe 1 leftover cookies polluting Probe 3's cookie-reuse
+  experiment, etc. In normal mode, probes share a session — that's
+  intentional, because Probe 3 specifically benefits from carrying
+  marketing-signin cookies forward.
+
+- `--version` CLI flag (prints the script version).
+- `PROBE_RUNNERS` table at module scope so each probe is callable as
+  a unit, both for the chained execution and the debug-all flow.
+
+### Changed
+- The 6 per-probe code blocks in `eu_direct_probe` are now defined
+  via a single `PROBE_RUNNERS` list. Same execution behavior for
+  normal mode; just less code duplication.
+- New `_finalize_tokens` and `_finalize_code_to_tokens` helpers
+  consolidate the validation step.
+
 ## [3.2.1] - 2026-04-28
 
 ### Fixed

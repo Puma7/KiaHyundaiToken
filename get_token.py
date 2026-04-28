@@ -15,8 +15,9 @@ gets at least one chance to recover.
 See README for usage and CHANGELOG for version history.
 """
 
-__version__ = "3.2.1"
+__version__ = "3.3.0"
 
+import argparse
 import base64
 import datetime as dt
 import getpass
@@ -1172,62 +1173,125 @@ def _validate_refresh_token(refresh_token, brand_config, log_path):
         return False
 
 
-def eu_direct_probe(email, password, brand_config, log_path):
-    """
-    Browserless login for Kia or Hyundai EU. Returns a token dict
-    (with refresh_token + access_token) on success, None on failure.
-
-    Probe order, battle-tested first:
-
-      0. Plain signin   — stdlib `requests`, plaintext password,
-                         CCSP client_id at /auth/account/signin.
-                         The same code that worked end-to-end against
-                         a real account. Immune to curl_cffi packaging
-                         issues (e.g. Windows wheels missing some
-                         impersonation profiles).
-      1. App-flow      — RSA-encrypted password + CCSP client_id via
-                         curl_cffi with TLS impersonation. What the
-                         official mobile app does.
-      2. Legacy        — Plaintext password + CCSP client_id via
-                         curl_cffi (mirrors Probe 0 but with mobile
-                         TLS fingerprint).
-      3. Marketing→CCSP — Marketing-client signin to seed cookies +
-                         aws-waf-token, then GET CCSP authorize on
-                         the same curl_cffi session. Try with
-                         prompt=none too.
-      4. OIDC discovery — GET /.well-known/openid-configuration. If
-                         it advertises grant_type=password, attempt
-                         ROPC at the advertised token_endpoint.
-      5. Backend realm — Direct ROPC against eu-account.kia.com's
-                         Keycloak realm.
-
-    Probes 0-3 produce a code that we exchange for tokens; probes 4-5
-    produce tokens directly via OIDC ROPC. All successful paths run
-    the same validation step before returning.
-    """
+def _finalize_tokens(tokens, name, brand_config, log_path):
+    """Validate tokens; return them on success, None otherwise."""
+    if not (tokens and tokens.get("refresh_token") and tokens.get("access_token")):
+        return None
+    if _validate_refresh_token(tokens["refresh_token"], brand_config, log_path):
+        _direct_log(log_path, f"  [JACKPOT] {name} tokens validated.")
+        return tokens
     _direct_log(
         log_path,
-        f"\n=== {brand_config['name']} Direct API Probe — "
-        f"{dt.datetime.now():%Y-%m-%d %H:%M:%S} ===",
+        f"  [WARN] {name} got tokens but validation failed — "
+        "returning anyway (may still work in Home Assistant).",
     )
-    _direct_log(log_path, f"Email: {email}")
+    return tokens
 
-    # ----------------------------------------------------------------
-    # Probe 0: stdlib requests, plaintext signin. Always tried first.
-    # ----------------------------------------------------------------
-    _direct_log(log_path, "\n--- Probe 0: Plain stdlib signin (v3.0 method) ---")
+
+def _finalize_code_to_tokens(s, code, name, brand_config, log_path):
+    """Code → token exchange → validation. Returns tokens or None."""
+    if not code:
+        return None
+    _direct_log(log_path, f"  [{name}] got code, exchanging for tokens…")
+    tokens = _exchange_code_for_tokens(s, code, brand_config, log_path)
+    return _finalize_tokens(tokens, name, brand_config, log_path)
+
+
+# ---------------------------------------------------------------------------
+# Per-probe runners. Each returns tokens-or-None and is independently
+# callable. Used both by the chained eu_direct_probe (early-return on
+# first success) and the debug-all mode (run them all in isolation).
+# ---------------------------------------------------------------------------
+PROBE_RUNNERS = [
+    (
+        0,
+        "Plain stdlib signin (v3.0 method)",
+        "no_curl",
+        lambda _s, bc, em, pw, lp: _probe_plain_signin(bc, em, pw, lp),
+    ),
+    (
+        1,
+        "App-flow (curl_cffi + RSA-encrypted password)",
+        "curl",
+        lambda s, bc, em, pw, lp: _finalize_code_to_tokens(
+            s, _form_signin_app_flow(s, bc, em, pw, lp), "Probe 1 / App-flow", bc, lp
+        ),
+    ),
+    (
+        2,
+        "Legacy (curl_cffi + plaintext signin)",
+        "curl",
+        lambda s, bc, em, pw, lp: _finalize_code_to_tokens(
+            s, _form_signin_legacy(s, bc, em, pw, lp), "Probe 2 / Legacy", bc, lp
+        ),
+    ),
+    (
+        3,
+        "Marketing → CCSP via cookie reuse",
+        "curl",
+        lambda s, bc, em, pw, lp: _finalize_code_to_tokens(
+            s,
+            _probe_marketing_to_ccsp(s, bc, em, pw, lp),
+            "Probe 3 / Marketing→CCSP",
+            bc,
+            lp,
+        ),
+    ),
+    (
+        4,
+        "OIDC discovery + ROPC",
+        "curl",
+        lambda s, bc, em, pw, lp: _finalize_tokens(
+            _probe_oidc_discovery(s, bc, em, pw, lp),
+            "Probe 4 / OIDC discovery",
+            bc,
+            lp,
+        ),
+    ),
+    (
+        5,
+        "Backend Keycloak realm (eu-account.*) direct ROPC",
+        "curl",
+        lambda s, bc, em, pw, lp: _finalize_tokens(
+            _probe_backend_realm(s, bc, em, pw, lp),
+            "Probe 5 / Backend realm",
+            bc,
+            lp,
+        ),
+    ),
+]
+
+
+def _make_curl_cffi_session_with_ua(log_path):
+    """Create a curl_cffi session and set headers. Returns session or None on setup failure."""
     try:
-        result = _probe_plain_signin(brand_config, email, password, log_path)
-    except Exception as exc:
-        _direct_log(log_path, f"  [Probe 0] unexpected error: {exc}")
-        result = None
-    if result:
-        return result
+        s, _ = _create_curl_cffi_session(log_path)
+    except RuntimeError as exc:
+        _direct_log(log_path, f"  [curl_cffi setup] {exc}")
+        return None
+    s.headers.update({
+        "Accept-Encoding": "gzip",
+        "User-Agent": random.choice(BROWSER_UA_POOL),
+    })
+    return s
 
-    # ----------------------------------------------------------------
-    # Probes 1-5 use curl_cffi with TLS impersonation. Set up a single
-    # session for them (cookies persist across probes within one run).
-    # ----------------------------------------------------------------
+
+def eu_direct_probe(email, password, brand_config, log_path, debug_all=False):
+    """
+    Browserless login for Kia or Hyundai EU.
+
+    Normal mode (debug_all=False): runs probes 0-5 in order, returns
+    the first success. The fallback chain is intact — same behavior
+    as v3.2.x.
+
+    Debug mode (debug_all=True): runs every probe regardless of
+    success, each in its own isolated curl_cffi session (probe 0 is
+    plain requests as always). Returns the first probe's tokens for
+    the user, but logs and prints which probes succeeded vs failed
+    so the user can verify the fallback chain is intact.
+
+    See PROBE_RUNNERS for the list of probes.
+    """
     try:
         from curl_cffi import requests as curl_requests  # noqa: F401
     except ImportError as exc:
@@ -1236,86 +1300,76 @@ def eu_direct_probe(email, password, brand_config, log_path):
             "Install it with: python -m pip install curl_cffi"
         ) from exc
 
-    chosen_ua = random.choice(BROWSER_UA_POOL)
-    _direct_log(log_path, f"\nUser-Agent for curl_cffi probes: {chosen_ua}")
-    try:
-        s, _ = _create_curl_cffi_session(log_path)
-    except RuntimeError as exc:
-        _direct_log(log_path, f"  [curl_cffi setup] {exc}")
-        _direct_log(log_path, "\n=== curl_cffi unusable on this build, only Probe 0 was tried ===\n")
-        return None
-
-    s.headers.update({
-        "Accept-Encoding": "gzip",
-        "User-Agent": chosen_ua,
-    })
-
-    def _finalize_with_code(path_name, code):
-        """Exchange code for tokens, validate, return tokens or None."""
-        if not code:
-            return None
-        _direct_log(log_path, f"  [{path_name}] got code, exchanging for tokens…")
-        tokens = _exchange_code_for_tokens(s, code, brand_config, log_path)
-        if not (tokens and tokens.get("refresh_token") and tokens.get("access_token")):
-            return None
-        return _finalize_with_tokens(path_name, tokens)
-
-    def _finalize_with_tokens(path_name, tokens):
-        """Validate tokens, return them on success (or warn-and-return on validation fail)."""
-        if not (tokens and tokens.get("refresh_token") and tokens.get("access_token")):
-            return None
-        if _validate_refresh_token(tokens["refresh_token"], brand_config, log_path):
-            _direct_log(log_path, f"  [JACKPOT] {path_name} tokens validated.")
-            return tokens
+    _direct_log(
+        log_path,
+        f"\n=== {brand_config['name']} Direct API Probe — "
+        f"{dt.datetime.now():%Y-%m-%d %H:%M:%S} ===",
+    )
+    _direct_log(log_path, f"Email: {email}")
+    if debug_all:
         _direct_log(
             log_path,
-            f"  [WARN] {path_name} got tokens but validation failed — "
-            "returning anyway (may still work in Home Assistant).",
+            "*** DEBUG-ALL mode: running every probe in isolation ***",
         )
-        return tokens
 
-    # Probe 1: app-flow (modern, RSA-encrypted, CCSP client)
-    _direct_log(log_path, "\n--- Probe 1: App-flow signin (RSA-encrypted) ---")
-    result = _finalize_with_code(
-        "Probe 1 / App-flow",
-        _form_signin_app_flow(s, brand_config, email, password, log_path),
-    )
-    if result:
-        return result
+    results = {}  # probe_idx -> tokens or None
 
-    # Probe 2: legacy un-encrypted signin (CCSP client, plaintext)
-    _direct_log(log_path, "\n--- Probe 2: Legacy signin (plaintext) ---")
-    result = _finalize_with_code(
-        "Probe 2 / Legacy",
-        _form_signin_legacy(s, brand_config, email, password, log_path),
-    )
-    if result:
-        return result
+    # In normal mode, probes 1-5 share a single curl_cffi session so
+    # cookies persist (Probe 3 specifically benefits from that).
+    # In debug mode, each probe gets a fresh session for fair
+    # isolation — otherwise Probe 1 leftover cookies could pollute
+    # Probe 3's cookie-reuse experiment.
+    shared_curl_session = None
 
-    # Probe 3: marketing-cookie reuse on the same curl_cffi session
-    _direct_log(log_path, "\n--- Probe 3: Marketing → CCSP via cookie reuse ---")
-    result = _finalize_with_code(
-        "Probe 3 / Marketing→CCSP",
-        _probe_marketing_to_ccsp(s, brand_config, email, password, log_path),
-    )
-    if result:
-        return result
+    for idx, name, kind, runner in PROBE_RUNNERS:
+        _direct_log(log_path, f"\n--- Probe {idx}: {name} ---")
+        if kind == "no_curl":
+            session = None  # probe 0 doesn't use curl_cffi
+        else:
+            if debug_all:
+                session = _make_curl_cffi_session_with_ua(log_path)
+            else:
+                if shared_curl_session is None:
+                    shared_curl_session = _make_curl_cffi_session_with_ua(log_path)
+                session = shared_curl_session
+            if session is None:
+                _direct_log(log_path, f"  [Probe {idx}] curl_cffi unavailable, skipping.")
+                results[idx] = None
+                continue
+        try:
+            tokens = runner(session, brand_config, email, password, log_path)
+        except Exception as exc:
+            _direct_log(log_path, f"  [Probe {idx}] unexpected error: {exc}")
+            tokens = None
+        results[idx] = tokens
 
-    # Probe 4: OIDC discovery + ROPC at advertised endpoint
-    _direct_log(log_path, "\n--- Probe 4: OIDC discovery + ROPC ---")
-    tokens = _probe_oidc_discovery(s, brand_config, email, password, log_path)
-    result = _finalize_with_tokens("Probe 4 / OIDC discovery", tokens)
-    if result:
-        return result
+        if tokens and not debug_all:
+            return tokens
 
-    # Probe 5: direct backend Keycloak realm
-    _direct_log(log_path, "\n--- Probe 5: Backend realm (eu-account.*) direct ROPC ---")
-    tokens = _probe_backend_realm(s, brand_config, email, password, log_path)
-    result = _finalize_with_tokens("Probe 5 / Backend realm", tokens)
-    if result:
-        return result
+    # Debug mode: print summary
+    if debug_all:
+        _direct_log(log_path, "\n=== DEBUG-ALL SUMMARY ===")
+        for idx, name, _kind, _runner in PROBE_RUNNERS:
+            status = "PASS" if results.get(idx) else "FAIL"
+            _direct_log(log_path, f"  Probe {idx}: [{status}]  {name}")
 
-    _direct_log(log_path, "\n=== All 5 probes exhausted, no token obtained ===\n")
+        print()
+        print("=" * 60)
+        print("DEBUG-ALL probe results")
+        print("=" * 60)
+        for idx, name, _kind, _runner in PROBE_RUNNERS:
+            status = "[PASS]" if results.get(idx) else "[FAIL]"
+            print(f"  Probe {idx}: {status}  {name}")
+        print("=" * 60)
+        print()
+
+        # Return the first successful probe's tokens for the user.
+        for idx, _name, _kind, _runner in PROBE_RUNNERS:
+            if results.get(idx):
+                return results[idx]
+        return None
+
+    _direct_log(log_path, "\n=== All probes exhausted, no token obtained ===\n")
     return None
 
 
@@ -1325,12 +1379,17 @@ def kia_eu_direct_probe(email, password, log_path):
     return eu_direct_probe(email, password, KIA_EU_BRAND_CONFIG, log_path)
 
 
-def _run_eu_direct(region, brand, brand_config):
+def _run_eu_direct(region, brand, brand_config, debug_all=False):
     """
     Browserless direct-API path for Kia/Hyundai EU. Prompts for
     credentials. If both direct-API paths fail, automatically falls
     back to the marketing-client browser flow as last resort, so the
     user always gets at least one chance to recover.
+
+    debug_all=True runs all probes regardless of success and prints
+    a summary table — useful for verifying that fallback paths are
+    actually still working (and not silently broken until the
+    primary fails).
     """
     debug_log_path = os.path.abspath(DEBUG_LOG_FILE)
     try:
@@ -1346,6 +1405,10 @@ def _run_eu_direct(region, brand, brand_config):
     redirect_short = brand_config["redirect_uri"].replace("https://", "").split("/")[0]
 
     print(f"Logging into {brand['name']} ({region['name']}) — no browser needed.\n")
+    if debug_all:
+        print("*** DEBUG-ALL mode: every probe will run, even after one succeeds.")
+        print("    Takes ~30-60s. A summary table prints at the end.")
+        print()
     print(f"Your credentials are sent only to {brand['name']}'s own endpoints")
     print(f"({host_short}, {redirect_short}), never to a third party,")
     print("never written to disk in plaintext. The password prompt below")
@@ -1356,9 +1419,14 @@ def _run_eu_direct(region, brand, brand_config):
         print("[ERROR] Email or password is empty. Aborting.")
         return
 
-    print("\nFetching token (typically 5–15 seconds)...\n")
+    if debug_all:
+        print("\nRunning all 6 probes — this takes a while...\n")
+    else:
+        print("\nFetching token (typically 5–15 seconds)...\n")
     try:
-        tokens = eu_direct_probe(email, password, brand_config, debug_log_path)
+        tokens = eu_direct_probe(
+            email, password, brand_config, debug_log_path, debug_all=debug_all
+        )
     except RuntimeError as exc:
         # Friendly message for missing curl_cffi / pycryptodome.
         print(f"[ERROR] {exc}")
@@ -1537,6 +1605,30 @@ def _run_browser_flow(region, brand):
 
 
 def main():
+    parser = argparse.ArgumentParser(
+        description="Get a Kia or Hyundai OAuth2 refresh token.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument(
+        "--debug-all-probes",
+        action="store_true",
+        help=(
+            "Diagnostic mode for Kia/Hyundai EU. Runs every probe in the "
+            "fallback chain (0..5) in isolation, regardless of which one "
+            "succeeds, and prints a PASS/FAIL summary at the end. Use this "
+            "to verify that fallback paths still work (and aren't silently "
+            "broken until the primary fails). Takes ~30-60 seconds and "
+            "uses your credentials for every probe — may trigger Kia's "
+            "rate limits if run too often."
+        ),
+    )
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"KiaHyundaiToken {__version__}",
+    )
+    args = parser.parse_args()
+
     try:
         region, brand = select_region_and_brand()
 
@@ -1545,10 +1637,12 @@ def main():
         # (we don't have validated app constants for them yet, and
         # they don't seem to sit behind the same anti-bot protection).
         if region["name"] == "Europe" and brand["name"] == "Kia":
-            _run_eu_direct(region, brand, KIA_EU_BRAND_CONFIG)
+            _run_eu_direct(region, brand, KIA_EU_BRAND_CONFIG, debug_all=args.debug_all_probes)
         elif region["name"] == "Europe" and brand["name"] == "Hyundai":
-            _run_eu_direct(region, brand, HYUNDAI_EU_BRAND_CONFIG)
+            _run_eu_direct(region, brand, HYUNDAI_EU_BRAND_CONFIG, debug_all=args.debug_all_probes)
         else:
+            if args.debug_all_probes:
+                print("[NOTE] --debug-all-probes only applies to Kia/Hyundai EU. Ignoring.")
             _run_browser_flow(region, brand)
     except KeyboardInterrupt:
         # Catches Ctrl+C during select prompts, email input, or the
