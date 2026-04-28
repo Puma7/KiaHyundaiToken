@@ -1,5 +1,79 @@
 # Changelog
 
+## [3.7.0] - 2026-04-28
+
+### Diagnostic findings from v3.6.0 `--debug-all-probes`
+
+Probe 7's enhanced error extraction (added in v3.6.0) returned no
+match in the run, AND `body[:1000]` only captured the page header
+(DOCTYPE, head section, OneTrust scripts) — the Keycloak error message
+lives much deeper in the form body. So v3.6.0's diagnostic was not
+deep enough. v3.7.0 fixes that by:
+
+  1. Searching the **full** response body (not first 1000 chars)
+  2. Capturing all `<input type="hidden">` fields from the GET
+     response and forwarding them in the POST body
+  3. Saving GET and POST HTML to `kia_probe7_get.html` /
+     `kia_probe7_post.html` when no error pattern matches, so the
+     full response is inspectable
+  4. Adding `kc_locale` to the POST data
+  5. Logging the GET vs POST body length diff + the POST page title
+     as an at-a-glance signal of whether anything changed
+
+### Added
+
+- **Probe 7 hidden-form-field extraction**: any `<input type="hidden">`
+  tags in the GET response are parsed and their values forwarded in
+  the POST body. Some Keycloak setups embed CSRF tokens, session
+  continuations or locale hints there and silently reject POSTs that
+  don't echo them back.
+
+- **Probe 7 broader error-message regex**: in addition to the named
+  classes (`kc-feedback-text`, `input-error`, `alert-error`,
+  `pf-c-form__helper-text`), v3.7.0 also matches any element whose
+  `class` contains `feedback`, `alert-error`, or `invalid-feedback`,
+  with text length 4-200 chars. Much harder for a custom Keycloak
+  theme to slip past.
+
+- **Probe 7 HTML dump**: when no error pattern matches, the GET and
+  POST HTML are written to `kia_probe7_get.html` / `kia_probe7_post.html`
+  next to `kia_debug.log`. This way the full response is available
+  for manual inspection — much more useful than truncating into
+  the log.
+
+- **Probe 7 length-diff log**: prints `GET body=X chars, POST body=Y
+  chars (diff=±N)` so even without a parsed error message we know
+  whether the response shape changed at all (silent rejection ≈ same
+  length; embedded error ≈ longer).
+
+- **`kc_locale` field added to POST data**: defaults to `en`, but if
+  a hidden `kc_locale` field is in the form, that value takes
+  precedence. Some Keycloak setups need this for credential
+  validation routing.
+
+### Status of the chain (unchanged)
+
+```
+0. Plain stdlib signin                                           [PASS today]
+1. App-flow (curl_cffi + RSA)                                    [PASS today]
+2. Legacy (curl_cffi + plaintext)                                [PASS today]
+3. Marketing → CCSP via cookie reuse                             [Historical, FAIL — WAF]
+4. OIDC discovery at fassade                                     [Historical, FAIL — 404]
+5. Backend Keycloak ROPC sweep                                   [FAIL — clients exist, ROPC off]
+6. Device flow at backend (discovery only)                       [FAIL — device flow off for those]
+7. Backend Keycloak authorization_code flow (form-based)         [FAIL — login rejected; v3.7
+                                                                  diagnostic should reveal why]
+```
+
+The next `--debug-all-probes` run with v3.7 will either:
+  (a) extract a Keycloak error message → tells us exactly why login
+      is rejected (separate user DB / IdP broker / etc.)
+  (b) save full HTML to disk → we can inspect manually
+
+Either way, the next iteration is the LAST one for the backend-realm
+chase: the answer will be either "fixable, here's how" or "structurally
+not viable, mark probe historical".
+
 ## [3.6.0] - 2026-04-28
 
 ### Diagnostic findings from v3.5.0 `--debug-all-probes`

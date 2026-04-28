@@ -15,7 +15,7 @@ gets at least one chance to recover.
 See README for usage and CHANGELOG for version history.
 """
 
-__version__ = "3.6.0"
+__version__ = "3.7.0"
 
 import argparse
 import base64
@@ -1529,7 +1529,7 @@ def _probe_backend_auth_code(s, brand_config, email, password, log_path):
         _direct_log(log_path, f"  [Probe 7] expected 200 with HTML, got {resp.status_code}")
         return None
 
-    body = resp.text or ""
+    get_body = resp.text or ""
 
     # ----------------------------------------------------------------
     # Step 2: parse the form action URL. Keycloak's login form looks
@@ -1539,14 +1539,14 @@ def _probe_backend_auth_code(s, brand_config, email, password, log_path):
     # ----------------------------------------------------------------
     form_match = re.search(
         r'<form[^>]+action=["\']([^"\']+)["\']',
-        body,
+        get_body,
         flags=re.IGNORECASE,
     )
     if not form_match:
         _direct_log(
             log_path,
             f"  [Probe 7] no <form action=...> found in HTML response; "
-            f"body[:300]={_safe_truncate(body, 300)}",
+            f"body[:300]={_safe_truncate(get_body, 300)}",
         )
         return None
 
@@ -1557,24 +1557,53 @@ def _probe_backend_auth_code(s, brand_config, email, password, log_path):
         form_action = urljoin(auth_url, form_action)
     _direct_log(log_path, f"  [Probe 7] login form action: {_safe_truncate(form_action, 200)}")
 
+    # Extract any hidden form fields from the GET body. Some Keycloak
+    # setups embed CSRF tokens / session continuations / locale hints
+    # as <input type="hidden"> in the login form, and silently reject
+    # POSTs that don't echo them back.
+    hidden_fields = {}
+    for m in re.finditer(
+        r'<input\s+[^>]*type=["\']hidden["\'][^>]*>',
+        get_body,
+        flags=re.IGNORECASE,
+    ):
+        tag = m.group(0)
+        name_m = re.search(r'name=["\']([^"\']+)["\']', tag, re.IGNORECASE)
+        value_m = re.search(r'value=["\']([^"\']*)["\']', tag, re.IGNORECASE)
+        if name_m:
+            hidden_fields[name_m.group(1)] = value_m.group(1) if value_m else ""
+    if hidden_fields:
+        _direct_log(
+            log_path,
+            f"  [Probe 7] extracted {len(hidden_fields)} hidden form field(s): "
+            f"{list(hidden_fields.keys())}",
+        )
+
     # ----------------------------------------------------------------
     # Step 3: POST credentials to the form action. Keycloak's standard
     # credential submission expects username + password (and optionally
-    # credentialId — empty is fine).
+    # credentialId — empty is fine). Also include any hidden fields
+    # captured from the GET response, plus the locale hint.
     # ----------------------------------------------------------------
-    _direct_log(log_path, f"\n  [Probe 7 — Login POST]")
+    post_data = dict(hidden_fields)  # start with whatever hidden fields the form had
+    post_data.update({
+        "username": email,
+        "password": password,
+        "credentialId": post_data.get("credentialId", ""),
+        # Keycloak's submit button is `<input name="login" value="Sign In">`.
+        # Some Keycloak setups validate that this field is present —
+        # without it the form may be treated as a synthetic submit.
+        "login": "Sign In",
+        # Locale hint — some Keycloak themes require it for the login
+        # to dispatch to the right credential validator.
+        "kc_locale": post_data.get("kc_locale", "en"),
+    })
+
+    _direct_log(log_path, f"\n  [Probe 7 — Login POST] data fields: {sorted(post_data.keys())}")
     try:
         resp = s.post(
             form_action,
-            data={
-                "username": email,
-                "password": password,
-                "credentialId": "",
-                # Keycloak's submit button is `<input name="login" value="Sign In">`.
-                # Some Keycloak setups validate that this field is present —
-                # without it the form may be treated as a synthetic submit.
-                "login": "Sign In",
-            },
+            data=post_data,
             headers={"Content-Type": "application/x-www-form-urlencoded"},
             timeout=15,
             allow_redirects=False,
@@ -1585,37 +1614,61 @@ def _probe_backend_auth_code(s, brand_config, email, password, log_path):
     _log_response(log_path, "Probe 7 login POST", resp)
 
     if resp.status_code not in (302, 303):
-        # Keycloak re-rendered the login form with an embedded error message
-        # — extract it. Standard Keycloak themes use a few patterns:
-        #   <span class="kc-feedback-text">…</span>
-        #   <span id="input-error">…</span>
-        #   <div class="alert alert-error">…</div>
-        # Pull whichever matches first.
-        body = resp.text or ""
+        # Keycloak re-rendered the login form with an embedded error.
+        # Search the FULL post body (not just first 1000 chars) for any
+        # of the known Keycloak error patterns.
+        post_body = resp.text or ""
         error_msg = None
         for pattern in (
             r'<span[^>]+class=["\'][^"\']*kc-feedback-text[^"\']*["\'][^>]*>\s*([^<]+?)\s*</span>',
             r'<span[^>]+id=["\']input-error["\'][^>]*>\s*([^<]+?)\s*</span>',
             r'<div[^>]+class=["\'][^"\']*alert-error[^"\']*["\'][^>]*>(?:\s*<[^>]+>\s*)*\s*([^<]+?)\s*<',
             r'<span[^>]+class=["\'][^"\']*pf-c-form__helper-text[^"\']*["\'][^>]*>\s*([^<]+?)\s*</span>',
+            # Even-broader fallback: look for anything mentioning
+            # "feedback" or "alert" and pull the inner text
+            r'<[^>]+class=["\'][^"\']*(?:feedback|alert-error|invalid-feedback)[^"\']*["\'][^>]*>(?:\s*<[^>]+>\s*)*\s*([^<]{4,200}?)\s*<',
         ):
-            m = re.search(pattern, body, re.DOTALL | re.IGNORECASE)
+            m = re.search(pattern, post_body, re.DOTALL | re.IGNORECASE)
             if m and m.group(1).strip():
                 error_msg = m.group(1).strip()
                 break
 
+        # Also: did the title change? Keycloak sometimes signals
+        # "logged in" via a different page title.
+        title_m = re.search(r"<title>([^<]+)</title>", post_body, re.IGNORECASE)
+        post_title = title_m.group(1).strip() if title_m else ""
+
+        # Save GET and POST HTML to disk for manual inspection — the
+        # user can then send the diff/snippet back to us instead of
+        # us trying to truncate it usefully into the log.
+        try:
+            log_dir = os.path.dirname(log_path) or "."
+            with open(os.path.join(log_dir, "kia_probe7_get.html"), "w",
+                      encoding="utf-8") as f:
+                f.write(get_body)
+            with open(os.path.join(log_dir, "kia_probe7_post.html"), "w",
+                      encoding="utf-8") as f:
+                f.write(post_body)
+            _direct_log(
+                log_path,
+                f"  [Probe 7] saved GET + POST HTML to "
+                f"kia_probe7_get.html / kia_probe7_post.html for inspection",
+            )
+        except OSError:
+            pass
+
         if error_msg:
             _direct_log(
                 log_path,
-                f"  [Probe 7] Keycloak error: '{error_msg}' "
-                "(login form re-rendered)",
+                f"  [Probe 7] Keycloak error: '{error_msg}' (login form re-rendered)",
             )
         else:
+            len_diff = len(post_body) - len(get_body)
             _direct_log(
                 log_path,
-                f"  [Probe 7] expected 302 redirect after login, got {resp.status_code} "
-                "(login form re-rendered without an extractable error message). "
-                f"body[:1000]={_safe_truncate(body, 1000)}",
+                f"  [Probe 7] login rejected — no extractable error message. "
+                f"GET body={len(get_body)} chars, POST body={len(post_body)} chars "
+                f"(diff={len_diff:+d}). POST title='{post_title}'.",
             )
         return None
 
