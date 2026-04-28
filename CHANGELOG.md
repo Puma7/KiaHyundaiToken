@@ -1,5 +1,79 @@
 # Changelog
 
+## [3.5.0] - 2026-04-28
+
+### Diagnostic findings from v3.4.0 `--debug-all-probes`
+
+The v3.4.0 Probe 5 sweep produced a major intermediate finding: the
+backend Keycloak realm at `eu-account.kia.com/auth/realms/eukiaidm`
+has FOUR known clients registered, all returning `unauthorized_client`
+(client EXISTS but ROPC not enabled):
+
+  - `peukiaidm-online-sales` ← marketing client, also lives at backend
+  - `account` (Keycloak default)
+  - `account-console` (Keycloak default)
+  - `admin-cli` (Keycloak default)
+
+ROPC being disabled doesn't kill the path — it just means we need a
+different grant type. The standard Keycloak `authorization_code` flow
+should still work for those clients (it's the most common Keycloak
+client config). Hence Probe 7 (below).
+
+The v3.4.0 Probe 6 sweep all returned "200 but body not JSON" for
+every candidate, which was a logging bug (no Accept header → Keycloak
+served HTML instead of JSON). Fixed in this release; the body content
+is now captured in the log so a similar mystery doesn't recur.
+
+### Added
+
+- **Probe 7 (NEW)**: backend Keycloak realm `authorization_code` flow.
+  Uses the marketing `client_id` (since v3.4.0 confirmed it's
+  registered at the backend) and goes through the full Keycloak
+  login flow:
+    1. GET the backend's authorize URL → expect HTML login form
+    2. Parse `<form action="…">` from the response
+    3. POST username + password to the form action → expect 302 with
+       `code=…` in the Location header
+    4. Exchange the code at the backend's token endpoint → tokens
+
+  Bails early with a clear log line if the backend authorize redirects
+  to the WAF-protected fassade (i.e., the backend delegates login to
+  the fassade — that would put us back in WAF territory). Token
+  responses from this path have `iss = eu-account.kia.com/auth/realms/
+  eukiaidm`, NOT `iss = "uvo"` like the working probes — printed
+  warning notes that Home Assistant may need a token translation step.
+
+- **Probe 6 fixed and improved**:
+  - Now sends `Accept: application/json` so Keycloak returns proper
+    JSON instead of an HTML login page.
+  - When a 200 response is still not JSON, the diagnostic log now
+    captures `Content-Type` and the first 300 chars of the body so
+    a similar mystery is one log read away from solved.
+
+### Notes
+
+The probe chain now has eight independent paths:
+
+```
+0. Plain stdlib signin                                           [PASS today]
+1. App-flow (curl_cffi + RSA)                                    [PASS today]
+2. Legacy (curl_cffi + plaintext)                                [PASS today]
+3. Marketing → CCSP via cookie reuse                             [Historical, FAIL]
+4. OIDC discovery at fassade                                     [Historical, FAIL — 404]
+5. Backend Keycloak ROPC sweep                                   [Currently no JACKPOT, but
+                                                                  found 4 EXISTING clients]
+6. Device flow at backend (discovery only)                       [Diagnostic; --device-flow
+                                                                  for interactive use]
+7. Backend Keycloak authorization_code flow (NEW)                [Untested-in-the-wild yet —
+                                                                  next debug-all run will tell]
+```
+
+Probe 7 is the most promising new addition. If the backend allows the
+marketing client to do `authorization_code` (which is overwhelmingly
+the default Keycloak client config), the next `--debug-all-probes` run
+should turn it from FAIL to PASS. That would give us a fourth working
+path — fully WAF-independent.
+
 ## [3.4.0] - 2026-04-28
 
 ### Diagnostic findings from v3.3.0 `--debug-all-probes`

@@ -15,7 +15,7 @@ gets at least one chance to recover.
 See README for usage and CHANGELOG for version history.
 """
 
-__version__ = "3.4.0"
+__version__ = "3.5.0"
 
 import argparse
 import base64
@@ -1276,7 +1276,14 @@ def _probe_device_flow_discover(s, brand_config, log_path):
         secret_label = "(secret)" if client_secret else "(public)"
         _direct_log(log_path, f"\n    [Probe 6 try] client_id={client_id} {secret_label}")
         try:
-            resp = s.post(device_endpoint, data=data, timeout=15)
+            # Explicit Accept header — Keycloak otherwise returns HTML
+            # if the client thinks it's a browser hitting an endpoint.
+            resp = s.post(
+                device_endpoint,
+                data=data,
+                headers={"Accept": "application/json"},
+                timeout=15,
+            )
         except Exception as exc:
             _direct_log(log_path, f"      network error: {exc}")
             continue
@@ -1285,7 +1292,16 @@ def _probe_device_flow_discover(s, brand_config, log_path):
             try:
                 body = resp.json()
             except ValueError:
-                _direct_log(log_path, "      200 but body not JSON")
+                # Keycloak gave us 200 but non-JSON. Log the actual
+                # body so we can see what it is (HTML login form?
+                # error page? empty?) — without this logging the
+                # mystery in v3.4.0 took 24h to solve.
+                content_type = resp.headers.get("Content-Type", "(no Content-Type)")
+                preview = _safe_truncate(resp.text or "(empty)", 300)
+                _direct_log(
+                    log_path,
+                    f"      200 but body not JSON; Content-Type={content_type} body[:300]={preview}",
+                )
                 continue
             if not (body.get("device_code") and body.get("user_code")):
                 _direct_log(log_path, "      200 but missing device_code/user_code")
@@ -1416,6 +1432,209 @@ def _interactive_device_flow_complete(s, finding, log_path):
         return None
 
     print("\n[ERROR] Device flow timed out without completion.")
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Probe 7: backend Keycloak realm authorization_code flow.
+#
+# The v3.4.0 debug-all run proved that the marketing client_id
+# `peukiaidm-online-sales` is registered at the backend Keycloak realm
+# (eu-account.kia.com) — Probe 5 sweep returned `unauthorized_client`
+# instead of `invalid_client` for it. ROPC is disabled there, but the
+# standard authorization_code flow may not be — that's the most common
+# Keycloak client config.
+#
+# So this probe attempts the FULL Keycloak browser-style flow but
+# headlessly: GET the authorize endpoint to receive a Keycloak login
+# form (HTML), parse the form action URL, POST username+password to
+# that action, hopefully receive a 302 redirect with a code in the
+# Location, then exchange the code at the backend's token endpoint.
+#
+# Two unknowns this probe will tell us about:
+#   1. Does the backend authorize endpoint render its own login page,
+#      or does it redirect to the WAF-protected fassade login? The
+#      former gives us a usable path; the latter is a dead end.
+#   2. If we get a Keycloak login form, does the standard form-action
+#      POST work, or does Keycloak need additional CSRF / session
+#      cookies / WebAuthn / second factor that this probe doesn't
+#      handle? The diagnostic log shows what comes back in either case.
+#
+# Tokens returned by this path have `iss = eu-account.kia.com/auth/...`,
+# not `iss = "uvo"` like the working probes. That MAY mean Home
+# Assistant rejects them — but it might also work because HA delegates
+# to hyundai_kia_connect_api which may accept either issuer. We log a
+# clear note so the user can decide.
+# ---------------------------------------------------------------------------
+def _probe_backend_auth_code(s, brand_config, email, password, log_path):
+    """
+    Probe 7: try the standard Keycloak authorization_code flow at
+    the backend realm. Returns tokens dict on success, None otherwise.
+    """
+    realm_url = brand_config.get("backend_realm_url")
+    if not realm_url:
+        _direct_log(log_path, "  [Probe 7] no backend_realm_url configured, skipping.")
+        return None
+
+    # Use the marketing client_id since Probe 5 confirmed it exists at
+    # the backend. Marketing redirect_uri is also a known-valid value.
+    backend_client_id = brand_config.get("marketing_client_id")
+    backend_redirect = brand_config.get("marketing_redirect_uri")
+    if not backend_client_id or not backend_redirect:
+        _direct_log(log_path, "  [Probe 7] marketing client/redirect not configured, skipping.")
+        return None
+
+    auth_url = (
+        f"{realm_url}/protocol/openid-connect/auth"
+        f"?client_id={backend_client_id}"
+        "&response_type=code"
+        f"&redirect_uri={backend_redirect}"
+        "&state=ccsp"
+        "&scope=openid"
+    )
+
+    # ----------------------------------------------------------------
+    # Step 1: GET the authorize URL. Keycloak should render an HTML
+    # login form. If it instead redirects to the fassade login, we're
+    # back in WAF territory — abort.
+    # ----------------------------------------------------------------
+    _direct_log(log_path, f"\n  [Probe 7 — Auth GET] GET {auth_url}")
+    try:
+        resp = s.get(auth_url, timeout=15, allow_redirects=False)
+    except Exception as exc:
+        _direct_log(log_path, f"  [Probe 7] auth GET network error: {exc}")
+        return None
+    _log_response(log_path, "Probe 7 auth GET", resp)
+
+    # If we get redirected, follow if it's still on the backend host.
+    # Bail if it goes to the fassade (WAF-protected).
+    if resp.status_code in (302, 303):
+        location = resp.headers.get("Location", "")
+        if "idpconnect-eu" in location or "idpconnect-eu.hyundai" in location:
+            _direct_log(
+                log_path,
+                "  [Probe 7] backend authorize redirected to WAF-protected fassade — dead end.",
+            )
+            return None
+        if not location:
+            return None
+        try:
+            resp = s.get(location, timeout=15, allow_redirects=False)
+        except Exception as exc:
+            _direct_log(log_path, f"  [Probe 7] auth follow network error: {exc}")
+            return None
+        _log_response(log_path, "Probe 7 auth GET (followed)", resp)
+
+    if resp.status_code != 200:
+        _direct_log(log_path, f"  [Probe 7] expected 200 with HTML, got {resp.status_code}")
+        return None
+
+    body = resp.text or ""
+
+    # ----------------------------------------------------------------
+    # Step 2: parse the form action URL. Keycloak's login form looks
+    # like <form id="kc-form-login" action="..." method="post">. The
+    # action URL embeds session/code parameters, so we have to extract
+    # it from the rendered HTML.
+    # ----------------------------------------------------------------
+    form_match = re.search(
+        r'<form[^>]+action=["\']([^"\']+)["\']',
+        body,
+        flags=re.IGNORECASE,
+    )
+    if not form_match:
+        _direct_log(
+            log_path,
+            f"  [Probe 7] no <form action=...> found in HTML response; "
+            f"body[:300]={_safe_truncate(body, 300)}",
+        )
+        return None
+
+    form_action = form_match.group(1).replace("&amp;", "&")
+    if not form_action.startswith("http"):
+        # relative URL — prepend host
+        from urllib.parse import urljoin
+        form_action = urljoin(auth_url, form_action)
+    _direct_log(log_path, f"  [Probe 7] login form action: {_safe_truncate(form_action, 200)}")
+
+    # ----------------------------------------------------------------
+    # Step 3: POST credentials to the form action. Keycloak's standard
+    # credential submission expects username + password (and optionally
+    # credentialId — empty is fine).
+    # ----------------------------------------------------------------
+    _direct_log(log_path, f"\n  [Probe 7 — Login POST]")
+    try:
+        resp = s.post(
+            form_action,
+            data={
+                "username": email,
+                "password": password,
+                "credentialId": "",
+            },
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            timeout=15,
+            allow_redirects=False,
+        )
+    except Exception as exc:
+        _direct_log(log_path, f"  [Probe 7] login POST network error: {exc}")
+        return None
+    _log_response(log_path, "Probe 7 login POST", resp)
+
+    if resp.status_code not in (302, 303):
+        _direct_log(
+            log_path,
+            f"  [Probe 7] expected 302 redirect after login, got {resp.status_code}. "
+            "Likely a Keycloak error page — credentials wrong or extra step (MFA).",
+        )
+        return None
+
+    location = resp.headers.get("Location", "")
+    match = re.search(r"[?&]code=([^&]+)", location)
+    if not match:
+        _direct_log(
+            log_path,
+            f"  [Probe 7] no code in redirect Location: {_safe_truncate(location, 200)}",
+        )
+        return None
+
+    auth_code = match.group(1)
+    _direct_log(log_path, "  [Probe 7] got auth code from backend Keycloak")
+
+    # ----------------------------------------------------------------
+    # Step 4: exchange code at backend token endpoint.
+    # ----------------------------------------------------------------
+    token_url = f"{realm_url}/protocol/openid-connect/token"
+    _direct_log(log_path, f"\n  [Probe 7 — Token exchange] POST {token_url}")
+    try:
+        resp = s.post(
+            token_url,
+            data={
+                "grant_type": "authorization_code",
+                "code": auth_code,
+                "redirect_uri": backend_redirect,
+                "client_id": backend_client_id,
+            },
+            timeout=15,
+        )
+    except Exception as exc:
+        _direct_log(log_path, f"  [Probe 7] token exchange network error: {exc}")
+        return None
+    _log_response(log_path, "Probe 7 token exchange", resp)
+
+    if resp.status_code != 200:
+        return None
+    try:
+        tokens = resp.json()
+    except ValueError:
+        return None
+    if tokens.get("refresh_token") and tokens.get("access_token"):
+        _direct_log(
+            log_path,
+            "  [Probe 7] backend authorization_code flow SUCCEEDED — "
+            "tokens issued by backend Keycloak (iss != 'uvo'). "
+            "May need translation for HA.",
+        )
+        return tokens
     return None
 
 
@@ -1645,6 +1864,17 @@ PROBE_RUNNERS = [
         # always returns None. To actually use device flow, run the
         # script with --device-flow.
         lambda s, bc, em, pw, lp: (_probe_device_flow_discover(s, bc, lp), None)[1],
+    ),
+    (
+        7,
+        "Backend Keycloak realm authorization_code flow (form-based)",
+        "curl",
+        lambda s, bc, em, pw, lp: _finalize_tokens(
+            _probe_backend_auth_code(s, bc, em, pw, lp),
+            "Probe 7 / Backend auth_code",
+            bc,
+            lp,
+        ),
     ),
 ]
 
