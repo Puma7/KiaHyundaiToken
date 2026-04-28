@@ -1,5 +1,47 @@
 # Changelog
 
+## [3.1.0] - 2026-04-27
+
+### Added
+- **Hyundai EU direct-API support.** Same non-browser flow as Kia EU,
+  using Hyundai's own endpoints (`idpconnect-eu.hyundai.com`,
+  `prd.eu-ccapi.hyundai.com`) and `client_id`. Marked experimental
+  pending community validation.
+- **TLS impersonation via `curl_cffi`.** Direct-API requests are now
+  sent with a real mobile-Chrome / mobile-Safari TLS fingerprint
+  (rotated per run from a pool of 5 profiles). Future-proof against
+  any TLS-based fingerprinting Kia/Hyundai may add.
+- **RSA-encrypted password.** Direct-API signin now fetches the IdP's
+  public key from `/auth/api/v1/accounts/certs`, encrypts the
+  password with PKCS#1 v1.5, and sends `encryptedPassword=true` —
+  exactly like the official mobile app. Future-proof against any
+  requirement to encrypt credentials.
+- **Cookie priming.** Direct-API flow now does an authorize GET
+  before the signin POST to seed session cookies, matching the
+  official app's request order.
+- **Token validation.** After signin succeeds, the freshly-minted
+  refresh_token is immediately used to fetch a new access_token.
+  Confirms the token actually works against the CCSP API before the
+  user pastes it into Home Assistant.
+- **Defensive legacy-signin fallback.** If the modern app-flow fails
+  (e.g. JWK endpoint down), falls back to the v3.0.0 un-encrypted
+  signin path. Still works today, kept as belt-and-braces.
+
+### Changed
+- Direct-API code refactored around a per-brand config dict
+  (`KIA_EU_BRAND_CONFIG`, `HYUNDAI_EU_BRAND_CONFIG`) instead of
+  hard-coded URLs and constants. Adding a new region/brand means
+  adding one dict.
+- Diagnostic log header now identifies which brand was attempted.
+- Dependencies: added `curl_cffi>=0.7.0` and `pycryptodome>=3.20.0`.
+
+### Removed
+- Diagnostic Probes 1, 2b, 3, 4 (ROPC, marketing-client signin,
+  CCSP authorize, device-register) and the Stamp HMAC machinery
+  that supported them. They never produced tokens — only data
+  about which endpoints were alive — and the new architecture has
+  the app-flow as primary so the diagnostics are no longer needed.
+
 ## [3.0.0] - 2026-04-27
 
 ### Added
