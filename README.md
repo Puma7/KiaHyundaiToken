@@ -1,63 +1,47 @@
-# KiaHyundaiToken v2.1.0
+# KiaHyundaiToken v3.0.0
 
-Get your **Kia** or **Hyundai** OAuth2 refresh token via a one-time browser
-login — worldwide.
+Get your **Kia** or **Hyundai** OAuth2 refresh token — worldwide.
 
-## Supported regions
+## How it works
 
-| # | Region       | Kia | Hyundai | Status |
-|---|--------------|-----|---------|--------|
-| 1 | Europe       | yes | yes     | Kia confirmed, Hyundai experimental |
-| 2 | China        | yes | yes     | untested |
-| 3 | Australia    | yes | yes     | untested |
-| 4 | New Zealand  | yes | —       | untested |
-| 5 | India        | yes | yes     | untested |
-| 6 | Brazil       | —   | yes     | untested |
+| Region | Brand | Method |
+|---|---|---|
+| **Europe** | **Kia** | **Direct API login** — no browser, just email + password in the terminal. Done in ~10 seconds. |
+| Europe | Hyundai | One-time browser login (Kia's EU IdP-redirect flow). Experimental. |
+| China, Australia, New Zealand, India, Brazil | Kia and/or Hyundai | One-time browser login. Untested — community validation needed. |
 
-> **USA / Canada:** These regions use a different authentication method
-> (direct API login, no browser required). Most integrations (e.g. Home
-> Assistant) handle authentication directly for these regions — you typically
-> do not need this tool. If you need USA/Canada support, please open an issue.
+Why two methods? In late 2025 Kia added stricter anti-bot protection on their EU login servers, which interferes with browser-based OAuth flows. For Kia EU users the script uses a non-browser path that talks to Kia's API directly with the same headers their official mobile app sends — so no Chrome window opens at all. Other regions still use the browser flow because they don't need the alternate path.
 
-> **"Untested"** means the credentials are extracted from open-source projects
-> but have not been validated with a real account yet. If you can confirm a
-> region works (or doesn't), please open an issue.
+> **USA / Canada:** These regions use a different authentication method (direct API login, no browser required). Most integrations (e.g. Home Assistant) handle authentication directly for these regions — you typically do not need this tool.
 
-## Why this exists
+> **"Untested"** means the credentials are extracted from the open-source `hyundai_kia_connect_api` project but have not been validated with a real account yet. If you can confirm a region works (or doesn't), please open an issue.
 
-The Kia and Hyundai login flows (especially in Europe) require solving a
-Google reCAPTCHA. Because CAPTCHAs cannot be automated reliably, most API
-clients (e.g. Home Assistant integrations) no longer accept your password
-directly. Instead, you log in once in a real browser and use the resulting
-**refresh token**.
+## Security
 
-> **Security:** Treat your refresh token like a password. Anyone who has it
-> can access your Kia or Hyundai account and vehicle data.
+Treat your **refresh token like a password**. Anyone who has it can access your Kia or Hyundai account and vehicle data (location, lock/unlock, climate, charging) for up to a year. Store it only in a password manager or your Home Assistant secrets file.
+
+For Kia EU's direct mode: your email and password are sent only to Kia's own endpoints (`idpconnect-eu.kia.com`, `prd.eu-ccapi.kia.com`). They are never written to disk in plaintext, never sent to a third party, never logged. The terminal hides your password while you type it.
 
 ## Requirements
 
-- Windows 10 or 11 (also works on macOS / Linux with Chrome + Python)
+- Windows 10 or 11 (also works on macOS / Linux with Python)
 - [Git for Windows](https://git-scm.com/download/win)
-- Google Chrome installed and up to date
 - Python 3.10 or newer
+- Google Chrome (only for non-EU regions or Hyundai EU — Kia EU uses no browser)
 
-ChromeDriver is installed **automatically** — the script detects your Chrome
-version and downloads the matching driver on first run. No manual setup needed.
+For browser-based flows, ChromeDriver is installed **automatically** — the script detects your Chrome version and downloads the matching driver on first run.
 
-No browser extensions are required. **No admin rights needed.**
+**No browser extensions required. No admin rights needed.**
 
 ## Before you start
 
 ### Opening PowerShell
 
-1. Press the **Windows key**, type **PowerShell**, and click
-   **"Windows PowerShell"** (not "as Administrator" — you do not need admin
-   rights).
+Press the **Windows key**, type **PowerShell**, and click **"Windows PowerShell"** (not "as Administrator" — you do not need admin rights).
 
 ### One-time setup: allow scripts
 
-On a fresh Windows installation, PowerShell blocks all scripts by default.
-You only need to run this **once** — it stays set permanently:
+On a fresh Windows installation, PowerShell blocks all scripts by default. You only need to run this **once** — it stays set permanently:
 
 ```powershell
 Set-ExecutionPolicy -Scope CurrentUser RemoteSigned
@@ -67,36 +51,24 @@ Type **Y** and press Enter when prompted.
 
 ### How pasting works
 
-In this guide you will copy a block of commands and paste it into PowerShell.
-
-- **Windows Terminal / new PowerShell:** right-click into the window or press
-  `Ctrl+V` to paste.
+- **Windows Terminal / new PowerShell:** right-click into the window or press `Ctrl+V` to paste.
 - **Classic PowerShell (blue window):** right-click into the window to paste.
 
-After pasting, **press Enter once**. All commands run automatically from top
-to bottom. At the end the script will ask you to select your **region** and
-then your **brand** (Kia or Hyundai). A Chrome window will open — that is
-expected, do not close it.
+After pasting, **press Enter once**. All commands run automatically.
 
 ## Quick Start
 
-Copy the **entire gray block** below, paste it into PowerShell, and press
-Enter. Everything runs automatically until a Chrome window opens for you to
-log in.
+Copy the **entire gray block** below, paste it into PowerShell, and press Enter. Everything runs automatically.
 
-It is safe to run repeatedly — it will update the code and recreate the
-environment each time.
+It is safe to run repeatedly — it always resets to a clean state.
 
 ```powershell
-# Clone or update the repository
+# Always start fresh — sweeps any broken/partial clone first
 if (Test-Path "$env:TEMP\KiaHyundaiToken") {
-    cd "$env:TEMP\KiaHyundaiToken"
-    git fetch origin main
-    git reset --hard origin/main
-} else {
-    git clone https://github.com/Puma7/KiaHyundaiToken.git "$env:TEMP\KiaHyundaiToken"
-    cd "$env:TEMP\KiaHyundaiToken"
+    Remove-Item -Recurse -Force "$env:TEMP\KiaHyundaiToken"
 }
+git clone https://github.com/Puma7/KiaHyundaiToken.git "$env:TEMP\KiaHyundaiToken"
+cd "$env:TEMP\KiaHyundaiToken"
 
 # (Re)create a clean virtual environment
 if (Get-Command deactivate -ErrorAction SilentlyContinue) { deactivate }
@@ -115,43 +87,17 @@ python get_token.py
 
 ### Why `python` and not `py`?
 
-After activating a virtual environment, always use **`python`** (not `py`).
-`py` may invoke a different Python interpreter than the one inside your venv,
-which causes `ModuleNotFoundError` even though you just installed the packages.
-
-### Running again later
-
-Just paste the same block again. It will:
-1. Reset to the latest code from `main`
-2. Rebuild the virtual environment from scratch (avoids stale packages)
-3. Run the script
+After activating a virtual environment, always use **`python`** (not `py`). `py` may invoke a different Python interpreter than the one inside your venv, which causes `ModuleNotFoundError` even though you just installed the packages.
 
 ## What happens after you paste
 
-1. PowerShell downloads the code and installs dependencies (takes a few
-   seconds, you don't need to do anything).
-2. The script asks you to **select your region** (Europe, China, Australia,
-   etc.). Type the number and press Enter.
-3. The script asks you to **select your brand** (Kia or Hyundai). Type the
-   number and press Enter.
-4. A **Chrome window opens automatically** — this is expected. **Do not close
-   it.**
-5. The login page appears. Log in with your email and password, and solve
-   any CAPTCHA if prompted.
-6. **For Europe:** The script detects login automatically and finishes the
-   OAuth flow. Switch back to PowerShell to see your tokens.
-   **For other regions:** After logging in, switch back to PowerShell and
-   **press Enter** to continue. The script will then extract your tokens.
-7. Chrome closes by itself. You are done.
+1. PowerShell downloads the code and installs dependencies (a few seconds).
+2. The script asks you to **select your region**. Type the number and press Enter.
+3. The script asks you to **select your brand** (Kia or Hyundai if both available).
+4. **For Kia EU:** the script prompts for your **Kia account email and password**, talks directly to Kia's API, and prints your tokens in ~10 seconds. No browser opens.
+5. **For other regions:** a Chrome window opens. Log in normally. The script detects login, completes the OAuth flow, and prints your tokens.
 
-Copy the **Refresh Token** and store it securely (e.g. in a password manager).
-
-## About PINs
-
-Some integrations (e.g. Home Assistant) ask for a **PIN** when sending
-vehicle commands (remote start, climate control, lock/unlock). This PIN is
-**not needed** by this tool — it only retrieves OAuth tokens. Enter the PIN
-in your integration when prompted.
+Copy the **Refresh Token** and store it securely.
 
 ## Using the token in Home Assistant
 
@@ -165,110 +111,57 @@ In the Kia UVO / Hyundai Bluelink integration:
 | Password | the **refresh token** from script output |
 | PIN      | only if the integration asks for one     |
 
-## Contributing new regions
-
-If you are from a region that is marked "untested" or not listed, you can
-help:
-
-1. **Try it.** Run the script, select your region, and report whether it
-   works.
-2. **Report.** Open a GitHub issue with:
-   - Your region and brand
-   - Whether the login page loaded correctly
-   - Whether tokens were returned
-   - Any error messages
-3. **CSS selectors.** If the login page works but the script does not detect
-   login automatically (you had to press Enter), inspect the page after login
-   and report a CSS selector that uniquely identifies a post-login element.
+The PIN is **not needed** by this tool — it is only required by Home Assistant when sending vehicle commands (remote start, climate, lock/unlock).
 
 ## Troubleshooting
 
-### `ModuleNotFoundError: No module named 'selenium.webdriver.common.by'`
+### Kia EU direct mode says "Could not obtain tokens"
 
-Packages were installed into a different Python than the one running the
-script. Fix:
+99 % of the time this is a typo in your email or password. Run the script again. The full request/response log is written to `kia_debug.log` in the working directory — passwords are **not** logged. If credentials are correct and it still fails, Kia may have changed an endpoint; please open an issue and attach the log.
 
-```powershell
-# Make sure the venv is active, then:
-python -m pip show selenium
-python -c "import sys; print(sys.executable)"
-```
+### `ModuleNotFoundError: No module named 'selenium...'`
 
-If `pip show` fails or the executable is not inside `.venv`, you need a fresh
-environment. Delete the folder and re-clone the repository.
+Packages were installed into a different Python than the one running the script. Make sure you activated the venv with `.\.venv\Scripts\Activate.ps1` before running `python -m pip install ...`. The Quick Start block above does this for you — re-run it.
 
-### `No module named pip.__main__`
-
-The venv was created without pip. Fix:
-
-```powershell
-python -m ensurepip --upgrade
-python -m pip install --upgrade pip
-```
-
-### Chrome window does not open
+### Chrome window does not open (browser flows only)
 
 - Make sure Google Chrome is installed and up to date.
 - Close all existing Chrome windows and retry.
 - Some corporate networks block ChromeDriver downloads; try a home network.
-- If you see "Google Chrome not found", the auto-installer cannot detect your
-  Chrome installation. Verify Chrome is in a standard install location.
-
-### ChromeDriver version mismatch
-
-If Chrome updated recently, the cached ChromeDriver may be outdated. The script
-automatically detects this and reinstalls the correct version. If it still
-fails, delete the cached driver folder and rerun:
-
-```powershell
-# The folder is typically at:
-# Windows: ~\appdata\local\chromedriver_autoinstaller\
-# macOS/Linux: ~/.local/share/chromedriver_autoinstaller/
-# Then just rerun the Quick Start block.
-```
-
-### Login succeeds but no tokens are printed
-
-- Keep the Chrome window visible during the entire flow.
-- Complete login fully, including any CAPTCHA.
-- For non-EU regions: remember to **press Enter** in PowerShell after login.
-- If the script still does not detect the redirect, close everything and
-  rerun from a fresh session.
-
-### Network or access errors
-
-- Ensure outbound connections to the API endpoints for your region are
-  allowed (see the console output for the exact domain).
-- VPNs, proxies, and firewalls can interfere — try a different network.
+- If you see "Google Chrome not found", verify Chrome is in a standard install location.
 
 ### `py` is not recognized
 
-If Python was installed via the **Microsoft Store**, the `py` launcher may
-not be available. Replace `py -m venv .venv` in the Quick Start with:
+If Python was installed via the **Microsoft Store**, the `py` launcher may not be available. Replace `py -m venv .venv` in the Quick Start with:
 
 ```powershell
 python -m venv .venv
 ```
 
-If neither `py` nor `python` works, Python is not installed or not in your
-PATH. Download it from [python.org](https://www.python.org/downloads/) and
-make sure to check **"Add Python to PATH"** during installation.
+If neither `py` nor `python` works, Python is not installed or not in your PATH. Download it from [python.org](https://www.python.org/downloads/) and check **"Add Python to PATH"** during installation.
 
 ### Script is disabled / execution policy error
 
-If you see *"running scripts is disabled on this system"*, run the one-time
-fix from the **Before you start** section above:
+If you see *"running scripts is disabled on this system"*, run the one-time fix from the **Before you start** section above:
 
 ```powershell
 Set-ExecutionPolicy -Scope CurrentUser RemoteSigned
 ```
 
-### `Remove-Item .venv` fails / "file in use"
-
-An orphaned Python process from a previous crashed run may lock files inside
-`.venv`. Close **all** PowerShell windows, then open a fresh one and retry.
-
 ### Lost or compromised refresh token
 
-Revoke sessions by signing out of Kia-related apps, then repeat the Quick
-Start to generate a new token.
+Just run the script again — it always issues a fresh token. The old one becomes invalid as soon as the new one is used.
+
+## Contributing
+
+If you are from a region marked "untested", you can help:
+
+1. **Try it.** Run the script, select your region, report whether it works.
+2. **Report.** Open a GitHub issue with your region/brand, whether the login page loaded, whether tokens were returned, and any error messages.
+3. **CSS selectors.** If the login page works but the script does not detect login automatically (you had to press Enter), inspect the page after login and report a CSS selector that uniquely identifies a post-login element.
+
+If you have a Kia or Hyundai account in a region where the script's browser flow keeps failing with login errors that look similar to what Kia EU users see, your region may also need a non-browser path. Open an issue with your region and the error message — the brand-specific constants we'd need are documented in the `hyundai_kia_connect_api` library, and we can wire them up.
+
+## Credits
+
+The Kia EU non-browser path reuses constants and the request-signing algorithm from the open-source [`hyundai_kia_connect_api`](https://github.com/Hyundai-Kia-Connect/hyundai_kia_connect_api) library. Thanks to that community for the groundwork — without it this tool would not exist.

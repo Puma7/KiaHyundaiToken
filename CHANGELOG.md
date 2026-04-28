@@ -1,5 +1,36 @@
 # Changelog
 
+## [3.0.0] - 2026-04-27
+
+### Added
+- **Browserless login flow for Kia EU.** Kia tightened anti-bot
+  protection on their EU login servers in late 2025, which made
+  the browser-based OAuth flow unreliable. Kia EU users now go
+  through a non-browser path that talks to Kia's API directly with
+  the same headers their official mobile app sends. End-to-end
+  ~10 seconds, no Chrome needed. Constants and request-signing
+  algorithm sourced from `hyundai_kia_connect_api`.
+- Diagnostic log written to `kia_debug.log` so login failures can
+  be debugged from request/response status codes (passwords are
+  never logged).
+- Rotating User-Agent for Kia EU requests, drawn from a pool of
+  current real-world browser strings.
+
+### Changed
+- **Routing is now automatic per region/brand.** No more mode
+  prompt — Kia EU uses the non-browser path, every other
+  region/brand uses the browser flow.
+
+### Removed
+- Mode selection prompt (Standard / Stealth / Maximum / Direct
+  from v2.x).
+- `undetected-chromedriver` dependency and the Stealth/Maximum
+  browser code paths that depended on it.
+
+### Fixed
+- The Kia EU login failure that affected every user of v2.x is
+  the reason this version exists. v3 takes a different route.
+
 ## [2.1.0] - 2026-03-21
 
 ### Added
