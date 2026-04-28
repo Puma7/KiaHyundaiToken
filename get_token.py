@@ -15,7 +15,7 @@ gets at least one chance to recover.
 See README for usage and CHANGELOG for version history.
 """
 
-__version__ = "3.5.0"
+__version__ = "3.6.0"
 
 import argparse
 import base64
@@ -1570,6 +1570,10 @@ def _probe_backend_auth_code(s, brand_config, email, password, log_path):
                 "username": email,
                 "password": password,
                 "credentialId": "",
+                # Keycloak's submit button is `<input name="login" value="Sign In">`.
+                # Some Keycloak setups validate that this field is present —
+                # without it the form may be treated as a synthetic submit.
+                "login": "Sign In",
             },
             headers={"Content-Type": "application/x-www-form-urlencoded"},
             timeout=15,
@@ -1581,11 +1585,38 @@ def _probe_backend_auth_code(s, brand_config, email, password, log_path):
     _log_response(log_path, "Probe 7 login POST", resp)
 
     if resp.status_code not in (302, 303):
-        _direct_log(
-            log_path,
-            f"  [Probe 7] expected 302 redirect after login, got {resp.status_code}. "
-            "Likely a Keycloak error page — credentials wrong or extra step (MFA).",
-        )
+        # Keycloak re-rendered the login form with an embedded error message
+        # — extract it. Standard Keycloak themes use a few patterns:
+        #   <span class="kc-feedback-text">…</span>
+        #   <span id="input-error">…</span>
+        #   <div class="alert alert-error">…</div>
+        # Pull whichever matches first.
+        body = resp.text or ""
+        error_msg = None
+        for pattern in (
+            r'<span[^>]+class=["\'][^"\']*kc-feedback-text[^"\']*["\'][^>]*>\s*([^<]+?)\s*</span>',
+            r'<span[^>]+id=["\']input-error["\'][^>]*>\s*([^<]+?)\s*</span>',
+            r'<div[^>]+class=["\'][^"\']*alert-error[^"\']*["\'][^>]*>(?:\s*<[^>]+>\s*)*\s*([^<]+?)\s*<',
+            r'<span[^>]+class=["\'][^"\']*pf-c-form__helper-text[^"\']*["\'][^>]*>\s*([^<]+?)\s*</span>',
+        ):
+            m = re.search(pattern, body, re.DOTALL | re.IGNORECASE)
+            if m and m.group(1).strip():
+                error_msg = m.group(1).strip()
+                break
+
+        if error_msg:
+            _direct_log(
+                log_path,
+                f"  [Probe 7] Keycloak error: '{error_msg}' "
+                "(login form re-rendered)",
+            )
+        else:
+            _direct_log(
+                log_path,
+                f"  [Probe 7] expected 302 redirect after login, got {resp.status_code} "
+                "(login form re-rendered without an extractable error message). "
+                f"body[:1000]={_safe_truncate(body, 1000)}",
+            )
         return None
 
     location = resp.headers.get("Location", "")

@@ -1,5 +1,87 @@
 # Changelog
 
+## [3.6.0] - 2026-04-28
+
+### Diagnostic findings from v3.5.0 `--debug-all-probes`
+
+The v3.5.0 run with the Probe 6 Accept-header fix and the new Probe 7
+gave us a clearer picture of the backend Keycloak realm:
+
+**Probe 6 — device flow init (with `Accept: application/json` fixed):**
+
+```
+fdc85c00-...           → 400 invalid_client      (not registered at backend)
+peukiaidm-online-sales → 401 unauthorized_client (CLIENT EXISTS, device flow disabled)
+account                → 401 unauthorized_client (CLIENT EXISTS, device flow disabled)
+account-console        → 400 (HTML — Keycloak rendered the login page)
+admin-cli              → 401 unauthorized_client (CLIENT EXISTS, device flow disabled)
+... (rest invalid_client) ...
+```
+
+So device flow is configured-off for every existing backend client.
+Confirms Probe 6 is dead — no path to tokens via device_code grant
+without backend reconfig at Kia's end.
+
+**Probe 7 — backend Keycloak `authorization_code` flow:**
+
+```
+[Probe 7 — Auth GET] status=200    ← Backend renders Keycloak login form ✓
+[Probe 7] login form action: https://eu-account.kia.com/auth/realms/eukiaidm/login-actions/authenticate?session_code=...
+[Probe 7 — Login POST] status=200  ← Form re-rendered (= login rejected)
+```
+
+The backend `peukiaidm-online-sales` client renders Keycloak's
+standard login form (no IdP-broker redirect — good). We POST
+credentials and Keycloak re-renders the form, which means our login
+was rejected. v3.5.0 truncated the response body to 500 chars so we
+couldn't see the actual error message. v3.6.0 fixes that.
+
+### Added
+
+- **Probe 7 Keycloak error extraction**: when the login POST returns
+  status 200 (= login form re-rendered with error), the response body
+  is parsed for Keycloak's standard error patterns
+  (`kc-feedback-text`, `input-error`, `alert-error`,
+  `pf-c-form__helper-text`) and the extracted message is logged
+  prominently. If no pattern matches, the first 1000 characters of
+  the body are dumped so the next iteration can debug what's there.
+
+- **`login` submit-button field added to POST**: Keycloak's login
+  form has `<input name="login" value="Sign In">` as the submit
+  button. Some Keycloak setups treat a missing `login` field as a
+  synthetic submit. Including it doesn't hurt the path that already
+  works and may unlock the path that doesn't.
+
+### Status of the chain
+
+```
+0. Plain stdlib signin                                           [PASS today]
+1. App-flow (curl_cffi + RSA)                                    [PASS today]
+2. Legacy (curl_cffi + plaintext)                                [PASS today]
+3. Marketing → CCSP via cookie reuse                             [Historical, FAIL — WAF]
+4. OIDC discovery at fassade                                     [Historical, FAIL — 404]
+5. Backend Keycloak ROPC sweep                                   [FAIL — 4 clients found, ROPC off]
+6. Device flow at backend (discovery only)                       [FAIL — device flow off for those 4]
+7. Backend Keycloak authorization_code flow (form-based)         [FAIL — login rejected; needs error
+                                                                  message extraction (v3.6 just added)
+                                                                  for next debug-all run]
+```
+
+Three working paths (0, 1, 2) — same as before, very robust.
+Probes 5/6/7 are research paths into the backend realm's
+authentication, currently dead-ending but better-instrumented now.
+
+The backend realm rejects credentials that the fassade accepts. Two
+hypotheses:
+  (a) Backend has its own user database (different from fassade's),
+      and our user only exists at the fassade.
+  (b) Backend's `peukiaidm-online-sales` client is configured to
+      delegate authentication to an IdP broker, and the form
+      we're hitting is a fallback that's never expected to succeed.
+
+The next `--debug-all-probes` run with v3.6 will show us the actual
+Keycloak error message, which will tell us which hypothesis is right.
+
 ## [3.5.0] - 2026-04-28
 
 ### Diagnostic findings from v3.4.0 `--debug-all-probes`
