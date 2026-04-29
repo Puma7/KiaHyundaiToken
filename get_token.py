@@ -15,7 +15,7 @@ gets at least one chance to recover.
 See README for usage and CHANGELOG for version history.
 """
 
-__version__ = "3.8.0"
+__version__ = "3.9.0"
 
 import argparse
 import base64
@@ -369,6 +369,16 @@ def _is_safe_to_delete(driver_path):
     # Only delete if the directory name looks like a Chrome version number
     dirname = os.path.basename(driver_dir)
     return bool(re.match(r"^\d+\.\d+\.\d+(\.\d+)?$", dirname))
+
+
+def _chrome_major_version():
+    """Return the installed Chrome major version (e.g. 125), or None.
+    Used by undetected-chromedriver to download the matching driver."""
+    try:
+        full = chromedriver_autoinstaller.get_chrome_version()
+        return int(full.split(".")[0])
+    except Exception:
+        return None
 
 
 def _create_standard_driver(user_agent):
@@ -1745,6 +1755,240 @@ def _probe_backend_auth_code(s, brand_config, email, password, log_path):
 
 
 # ---------------------------------------------------------------------------
+# Probe 8: real-browser automation at the backend Keycloak realm.
+#
+# The 2026-04-28 v3.7 debug-all run conclusively showed that Probe 7's
+# only blocker is Google reCAPTCHA v3 (site key 6Ld2GsMrAAAA…) on the
+# backend login form. reCAPTCHA v3 is invisible — no user-facing
+# challenge, just JS that scores the browser session and produces a
+# Google-signed token. So a *real* Chrome browser executing the page's
+# JS naturally generates that token; only headless/scripted requests
+# fail because Google flags them as bots.
+#
+# Probe 8 leverages that: launch undetected-chromedriver against
+# eu-account.kia.com (which is NOT behind AWS WAF — confirmed by Probe
+# 5 discovery), let it run the page's JS, navigate the multi-step
+# Kia login UI (email → Continue → password → Log In), and extract
+# the auth code from the final redirect URL.
+#
+# This is opt-in via `--keycloak-browser` — it isn't part of the
+# automatic probe chain because (a) it spawns a Chrome window which
+# is interactive UX, (b) it takes ~15-30 seconds vs the REST probes'
+# ~3 seconds, (c) tokens come from the backend realm with iss=eu-
+# account.kia.com which may need translation for Home Assistant.
+#
+# This is THE futureproof fallback for the day Probes 0-2 break (i.e.
+# Kia adds reCAPTCHA or attestation to the REST signin endpoint too).
+# At that point, every browser-based path EXCEPT this one is dead,
+# because they're either WAF-blocked (fassade) or reCAPTCHA-blocked
+# without a real browser.
+# ---------------------------------------------------------------------------
+def _probe_keycloak_browser(brand_config, email, password, log_path,
+                            headless=False, debug_log_extras=True):
+    """
+    Drive a real Chrome browser through the backend Keycloak login
+    flow, including Google's reCAPTCHA v3 (which Chrome handles
+    naturally). Returns a token dict (Keycloak-native, iss=backend
+    realm) on success, None on failure.
+    """
+    try:
+        import undetected_chromedriver as uc
+    except ImportError as exc:
+        raise RuntimeError(
+            "Probe 8 (--keycloak-browser) requires undetected-chromedriver. "
+            "Install it with: python -m pip install undetected-chromedriver"
+        ) from exc
+
+    realm_url = brand_config.get("backend_realm_url")
+    backend_client_id = brand_config.get("marketing_client_id")
+    backend_redirect = brand_config.get("marketing_redirect_uri")
+    if not realm_url or not backend_client_id or not backend_redirect:
+        _direct_log(log_path, "  [Probe 8] backend_realm_url / marketing_* not configured, skipping.")
+        return None
+
+    auth_url = (
+        f"{realm_url}/protocol/openid-connect/auth"
+        f"?client_id={backend_client_id}"
+        "&response_type=code"
+        f"&redirect_uri={backend_redirect}"
+        "&state=ccsp"
+        "&scope=openid"
+    )
+
+    _direct_log(log_path, f"\n=== Probe 8: real-browser Keycloak login ===")
+    _direct_log(log_path, f"  auth URL: {auth_url}")
+    _direct_log(log_path, f"  headless: {headless}")
+
+    options = uc.ChromeOptions()
+    options.add_argument("--start-maximized")
+    options.add_argument("--no-sandbox")
+    options.add_argument("--disable-dev-shm-usage")
+    # Real-looking UA — uc sets one by default but we override to a
+    # current desktop Chrome to match what reCAPTCHA expects.
+    options.add_argument(
+        "--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/130.0.0.0 Safari/537.36"
+    )
+
+    driver = None
+    try:
+        print("[Probe 8] Starting undetected Chrome — first run downloads "
+              "ChromeDriver, this can take 10-30 seconds...")
+        driver = uc.Chrome(
+            options=options,
+            version_main=_chrome_major_version(),
+            use_subprocess=True,
+            headless=headless,
+        )
+        driver.set_page_load_timeout(60)
+
+        # Step 1: navigate to backend Keycloak login
+        _direct_log(log_path, "\n  [Probe 8] Loading login page...")
+        driver.get(auth_url)
+
+        wait = WebDriverWait(driver, 30)
+
+        # Step 2: fill email, click Continue
+        # Kia's custom Keycloak theme has a multi-step UI:
+        #   step 2: email field visible (#FormEmail) + button "Continue"
+        #   step 3: password field visible (#FormPassword) + button "Log In"
+        _direct_log(log_path, "  [Probe 8] Waiting for email field...")
+        email_field = wait.until(
+            EC.element_to_be_clickable((By.ID, "FormEmail"))
+        )
+        email_field.clear()
+        email_field.send_keys(email)
+        time.sleep(0.5)  # let JS validators settle
+
+        _direct_log(log_path, "  [Probe 8] Clicking Continue...")
+        login_btn = wait.until(EC.element_to_be_clickable((By.ID, "BtnLogin")))
+        # Use JS click — bypasses any visibility issues with overlays
+        driver.execute_script("arguments[0].click();", login_btn)
+
+        # Step 3: wait for password field, fill, click Log In
+        _direct_log(log_path, "  [Probe 8] Waiting for password field...")
+        pwd_field = wait.until(
+            EC.visibility_of_element_located((By.ID, "FormPassword"))
+        )
+        # Extra wait — JS animation, focus transition, etc.
+        time.sleep(1.0)
+        pwd_field.clear()
+        pwd_field.send_keys(password)
+        time.sleep(0.5)
+
+        _direct_log(log_path, "  [Probe 8] Clicking Log In (triggers reCAPTCHA + form submit)...")
+        login_btn2 = driver.find_element(By.ID, "BtnLogin")
+        driver.execute_script("arguments[0].click();", login_btn2)
+
+        # Step 4: wait for the redirect-with-code OR an error.
+        # On success: URL becomes https://www.kia.com/api/bin/oneid/login?code=…
+        # On failure: URL stays at eu-account.kia.com with an error in the page,
+        #             OR redirects but shows recaptcha_failed_v3 etc.
+        _direct_log(log_path, "  [Probe 8] Waiting for redirect with code (up to 60s)...")
+        redirect_wait = WebDriverWait(driver, 60)
+        try:
+            redirect_wait.until(
+                lambda d: ("code=" in d.current_url and "kia.com" in d.current_url)
+                or "/error" in d.current_url
+                or "recaptcha_failed" in (d.page_source or "")
+            )
+        except TimeoutException:
+            _direct_log(log_path, f"  [Probe 8] timed out waiting for redirect; current_url={driver.current_url}")
+            if debug_log_extras:
+                try:
+                    log_dir = os.path.dirname(log_path) or "."
+                    with open(os.path.join(log_dir, "kia_probe8_timeout.html"), "w", encoding="utf-8") as f:
+                        f.write(driver.page_source or "")
+                    _direct_log(log_path, "  [Probe 8] saved page source to kia_probe8_timeout.html")
+                except OSError:
+                    pass
+            return None
+
+        current_url = driver.current_url
+        _direct_log(log_path, f"  [Probe 8] post-login URL: {_safe_truncate(current_url, 200)}")
+
+        # Capture cookies from this session for the token-exchange call —
+        # Keycloak issues HttpOnly session cookies that the exchange
+        # request shouldn't actually need (auth code is enough), but
+        # log them for diagnostic purposes.
+        if debug_log_extras:
+            try:
+                cookies = driver.get_cookies()
+                _direct_log(log_path, f"  [Probe 8] {len(cookies)} cookies on session")
+            except Exception:
+                pass
+
+        if "/error" in current_url or "recaptcha_failed" in (driver.page_source or ""):
+            page_src = driver.page_source or ""
+            err_m = re.search(r'recaptcha_failed_v\d', page_src)
+            error_marker = err_m.group(0) if err_m else "(error page)"
+            _direct_log(
+                log_path,
+                f"  [Probe 8] login rejected: {error_marker}. "
+                "Google's reCAPTCHA v3 score was below Kia's accept threshold. "
+                "Try non-headless mode (drop --keycloak-browser-headless), or "
+                "use the same browser profile repeatedly to build trust.",
+            )
+            return None
+
+        match = re.search(r"[?&]code=([^&]+)", current_url)
+        if not match:
+            _direct_log(log_path, f"  [Probe 8] no code= in final URL")
+            return None
+        auth_code = match.group(1)
+        _direct_log(log_path, "  [Probe 8] got auth code from real-browser Keycloak login")
+
+    except WebDriverException as exc:
+        _direct_log(log_path, f"  [Probe 8] WebDriver error: {exc}")
+        return None
+    except Exception as exc:
+        _direct_log(log_path, f"  [Probe 8] unexpected error: {exc}")
+        return None
+    finally:
+        if driver:
+            try:
+                driver.quit()
+            except Exception:
+                pass
+
+    # Step 5: exchange the auth code at the BACKEND token endpoint
+    # (not the fassade's). Plain `requests` is fine — the backend
+    # token endpoint isn't WAF-protected.
+    token_url = f"{realm_url}/protocol/openid-connect/token"
+    _direct_log(log_path, f"\n  [Probe 8 — Token exchange] POST {token_url}")
+    try:
+        resp = requests.post(
+            token_url,
+            data={
+                "grant_type": "authorization_code",
+                "code": auth_code,
+                "redirect_uri": backend_redirect,
+                "client_id": backend_client_id,
+            },
+            timeout=30,
+        )
+    except requests.RequestException as exc:
+        _direct_log(log_path, f"  [Probe 8 token exchange] network error: {exc}")
+        return None
+    _log_response(log_path, "Probe 8 token exchange", resp)
+    if resp.status_code != 200:
+        return None
+    try:
+        tokens = resp.json()
+    except ValueError:
+        return None
+    if tokens.get("refresh_token") and tokens.get("access_token"):
+        _direct_log(
+            log_path,
+            "  [Probe 8] real-browser Keycloak login SUCCEEDED — "
+            "Keycloak-native tokens (iss = backend realm).",
+        )
+        return tokens
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Probe 0: plain `requests` + plaintext signin (the v3.0.0 method)
 #
 # This is the first thing we try, because it is the same code path
@@ -2392,6 +2636,80 @@ def _run_device_flow(region, brand, brand_config):
         print("      reason and we'd need a token-translation step.")
 
 
+def _run_keycloak_browser(region, brand, brand_config, headless=False):
+    """
+    Probe 8 entry point: drive a real Chrome browser through the
+    backend Keycloak login form (which has Google reCAPTCHA v3).
+    Triggered explicitly via --keycloak-browser; doesn't go through
+    the automatic probe chain. Tokens are Keycloak-native (iss=
+    backend realm), may need translation for Home Assistant.
+    """
+    debug_log_path = os.path.abspath(DEBUG_LOG_FILE)
+    try:
+        with open(debug_log_path, "w", encoding="utf-8") as f:
+            f.write(
+                f"{brand_config['name']} keycloak-browser log — "
+                f"{dt.datetime.now():%Y-%m-%d %H:%M:%S}\n"
+            )
+    except OSError:
+        pass
+
+    print(f"Real-browser Keycloak login for {brand['name']} ({region['name']}).")
+    print("EXPERIMENTAL: this is the futureproof fallback for the day Kia")
+    print("locks down the REST API used by the regular probe chain.")
+    print()
+    print("How it works: Chrome will open and log in at Kia's backend")
+    print("Keycloak server. Google's reCAPTCHA v3 runs invisibly — your")
+    print("browser session is scored, and if it looks human enough, the")
+    print("login goes through. No password is shown anywhere; you type")
+    print("it once into this terminal and the script types it into the")
+    print("browser for you.")
+    print()
+    if headless:
+        print("Mode: HEADLESS (no Chrome window will appear). Higher risk")
+        print("of reCAPTCHA blocking; if it fails, retry without --headless.")
+    else:
+        print("Mode: VISIBLE (a Chrome window will appear). Don't close it")
+        print("manually — the script will close it after login.")
+    print()
+    email = input("Email:    ").strip()
+    password = getpass.getpass("Password: ")
+    if not email or not password:
+        print("[ERROR] Email or password is empty. Aborting.")
+        return
+
+    print(f"\nStarting Chrome and navigating to {brand_config['backend_realm_url']}...\n")
+    try:
+        tokens = _probe_keycloak_browser(
+            brand_config, email, password, debug_log_path, headless=headless
+        )
+    except RuntimeError as exc:
+        print(f"[ERROR] {exc}")
+        print("Re-run pip install -r requirements.txt and try again.")
+        return
+
+    if tokens and tokens.get("refresh_token") and tokens.get("access_token"):
+        print(
+            f"\n[OK] Your tokens (Keycloak-native — may need translation for HA):\n\n"
+            f"- Refresh Token: {tokens['refresh_token']}\n"
+            f"- Access Token:  {tokens['access_token']}\n"
+        )
+        print("NOTE: tokens issued by the backend Keycloak realm have")
+        print(f"      iss = {brand_config['backend_realm_url']}")
+        print("      whereas the CCSP API expects iss = 'uvo'. Test these")
+        print("      in Home Assistant; if they don't work, see CHANGELOG")
+        print("      v3.9.0 for the architectural reason and possible")
+        print("      translation step.")
+    else:
+        print("[ERROR] Could not obtain tokens via real-browser login.")
+        print("Possible reasons:")
+        print("  - Wrong email or password")
+        print("  - Google reCAPTCHA v3 scored the browser session too low")
+        print(f"    (try without --keycloak-browser-headless for higher score)")
+        print("  - Kia changed the form structure")
+        print(f"\nDiagnostic log: {debug_log_path}")
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Get a Kia or Hyundai OAuth2 refresh token.",
@@ -2425,14 +2743,58 @@ def main():
         ),
     )
     parser.add_argument(
+        "--keycloak-browser",
+        action="store_true",
+        help=(
+            "EXPERIMENTAL Kia/Hyundai EU only: launch a real Chrome browser "
+            "(via undetected-chromedriver), navigate the backend Keycloak "
+            "login form, and let Google's reCAPTCHA v3 run naturally in "
+            "the browser. This is the futureproof fallback for the day "
+            "Probes 0/1/2 (the REST API path) get locked down. Slow (~15-30s) "
+            "and visible by default — use --keycloak-browser-headless for "
+            "headless mode (higher risk of reCAPTCHA blocking). Tokens are "
+            "Keycloak-native (iss=backend realm), may need translation for HA."
+        ),
+    )
+    parser.add_argument(
+        "--keycloak-browser-headless",
+        action="store_true",
+        help=(
+            "Implies --keycloak-browser and runs Chrome in headless mode. "
+            "More automation-friendly, but Google's reCAPTCHA v3 is more "
+            "likely to score a headless browser too low and reject the "
+            "login. Try this first; fall back to --keycloak-browser "
+            "(visible) if it fails."
+        ),
+    )
+    parser.add_argument(
         "--version",
         action="version",
         version=f"KiaHyundaiToken {__version__}",
     )
     args = parser.parse_args()
 
+    # --keycloak-browser-headless implies --keycloak-browser.
+    if args.keycloak_browser_headless:
+        args.keycloak_browser = True
+
     try:
         region, brand = select_region_and_brand()
+
+        # --keycloak-browser short-circuits the probe chain entirely.
+        if args.keycloak_browser:
+            if region["name"] != "Europe" or brand["name"] not in ("Kia", "Hyundai"):
+                print("[NOTE] --keycloak-browser is only implemented for Kia/Hyundai EU.")
+                return
+            brand_cfg = (
+                KIA_EU_BRAND_CONFIG if brand["name"] == "Kia"
+                else HYUNDAI_EU_BRAND_CONFIG
+            )
+            _run_keycloak_browser(
+                region, brand, brand_cfg,
+                headless=args.keycloak_browser_headless,
+            )
+            return
 
         # --device-flow short-circuits the probe chain entirely.
         if args.device_flow:

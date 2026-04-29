@@ -1,5 +1,87 @@
 # Changelog
 
+## [3.9.0] - 2026-04-28
+
+### Added — Probe 8 (futureproof fallback)
+
+The day Probes 0/1/2 (the REST API path) get locked down by Kia,
+every probe in the chain we documented in v3.8.0 would die with them
+— except this new one. **Probe 8 drives a real Chrome browser
+through the backend Keycloak login flow**, letting Google's
+reCAPTCHA v3 run naturally in the browser's JS engine. The reCAPTCHA
+score is determined by Google evaluating the browser session (mouse
+movements, fingerprint, history) — a real Chrome typically passes,
+which is the entire point.
+
+Why this works where Probe 7 (raw HTTP POST to the same form) didn't:
+reCAPTCHA v3 is **invisible** — no user-facing CAPTCHA challenge,
+just JS that scores the session. A real browser executing the page's
+JS naturally generates a Google-signed token; an HTTP POST without
+running that JS gets rejected with `recaptcha_failed_v3`. We finally
+took the hint and wired up `undetected-chromedriver` against the
+backend Keycloak (`eu-account.kia.com`), which — crucially — is NOT
+behind AWS WAF (we proved that in v3.4 / v3.5 discovery probes).
+
+Implementation:
+
+- New `_probe_keycloak_browser` function uses
+  `undetected-chromedriver` to drive Chrome through Kia's custom
+  multi-step Keycloak login form (`#FormEmail` + Continue → wait →
+  `#FormPassword` + Log In → reCAPTCHA runs invisibly → form
+  submits → redirect with auth code).
+- Auth code is then exchanged at the backend realm's token endpoint
+  (`eu-account.kia.com/auth/realms/eukiaidm/protocol/openid-connect/token`).
+- Tokens are Keycloak-native (`iss` = backend realm), NOT
+  `iss="uvo"` like the REST-API tokens. Whether Home Assistant /
+  `hyundai_kia_connect_api` accept these is unverified — printed
+  warning notes the issue so the user can test and report back.
+
+### Added — CLI flags
+
+- `--keycloak-browser`: trigger Probe 8 explicitly. Skips the
+  regular probe chain, prompts for credentials, opens Chrome
+  (visible by default), navigates the Keycloak login form, returns
+  tokens.
+- `--keycloak-browser-headless`: implies `--keycloak-browser` and
+  runs Chrome in headless mode. More automation-friendly, but
+  Google's reCAPTCHA v3 is more likely to score a headless browser
+  too low and reject the login.
+- `undetected-chromedriver>=3.5.5` re-added to requirements.txt
+  (was removed in v3.0.0 cleanup; needed again for Probe 8).
+- `_chrome_major_version` helper restored for uc's
+  `version_main` parameter.
+
+### Status of the chain
+
+```
+0. Plain stdlib signin                                        [PASS today]
+1. App-flow (curl_cffi + RSA)                                 [PASS today]
+2. Legacy (curl_cffi + plaintext)                             [PASS today]
+3. Marketing → CCSP cookie reuse                              [Historical, FAIL]
+4. OIDC discovery at fassade                                  [Historical, FAIL]
+5. Backend Keycloak ROPC sweep                                [Historical, FAIL]
+6. Device flow at backend (discovery only)                    [Historical, FAIL]
+7. Backend Keycloak authorization_code (raw HTTP)             [Historical, FAIL — recaptcha_failed_v3]
+8. Backend Keycloak via real Chrome (--keycloak-browser)      [INSURANCE — for the day 0/1/2 break]
+```
+
+Probe 8 is opt-in via `--keycloak-browser` (not in the auto chain
+because it spawns Chrome which is interactive UX). It's THE
+remaining browserside fallback if the REST API path ever gets
+reCAPTCHA / attestation requirements added. If that day comes, the
+user runs the script with `--keycloak-browser` and gets a token —
+worst case visible Chrome window, ~15-30 seconds, done.
+
+### Notes — what would still kill Probe 8
+
+- Kia adds AWS WAF to the backend (`eu-account.kia.com`) too: dead.
+- Kia raises reCAPTCHA score threshold so high that even a real
+  Chrome can't pass without browsing history: degrades to "unreliable".
+- Google retires reCAPTCHA v3 (low chance, but they replaced v2 once).
+
+But these would also kill the official Kia website login, so they're
+unlikely without a coordinated app-version rollout.
+
 ## [3.8.0] - 2026-04-28
 
 ### The chain is fully characterized
