@@ -1,19 +1,71 @@
+"""
+KiaHyundaiToken — get a Kia or Hyundai OAuth2 refresh token.
+
+Two execution paths, picked automatically by region + brand:
+  * Kia EU / Hyundai EU: browserless direct-API login. POSTs the
+    user's credentials (RSA-encrypted) to the IdP's /auth/account/signin
+    endpoint with the official mobile-app's TLS fingerprint, exchanges
+    the resulting code for tokens, validates the result. ~10 seconds.
+  * All other regions: existing Selenium-based one-time browser login.
+
+If the EU direct path fails (e.g. an IdP endpoint changes), the
+browser flow is offered as an automatic fallback so the user always
+gets at least one chance to recover.
+
+See README for usage and CHANGELOG for version history.
+"""
+
+__version__ = "3.10.0"
+
+import argparse
 import base64
 import datetime as dt
 import getpass
+import hashlib
+import json
 import os
 import random
 import re
+import secrets
 import shutil
+import time
 
-from selenium import webdriver
-from selenium.webdriver.chrome.service import Service
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
-from selenium.common.exceptions import TimeoutException, WebDriverException
+# Selenium + chromedriver_autoinstaller are only needed for the
+# browser-based flows (non-EU regions, --keycloak-browser). EU users
+# (Kia/Hyundai EU) hit the REST API path and never need a browser at
+# all, so a broken Chrome stack must NOT block them. Wrap the imports
+# in a try/except and let browser-flow callers raise a friendly error
+# at call time if these turn out to be missing.
+try:
+    from selenium import webdriver
+    from selenium.webdriver.chrome.service import Service
+    from selenium.webdriver.common.by import By
+    from selenium.webdriver.support.ui import WebDriverWait
+    from selenium.webdriver.support import expected_conditions as EC
+    from selenium.common.exceptions import TimeoutException, WebDriverException
+    _SELENIUM_IMPORT_ERROR = None
+except ImportError as _exc:
+    webdriver = None
+    Service = None
+    By = None
+    WebDriverWait = None
+    EC = None
+
+    class TimeoutException(Exception):
+        pass
+
+    class WebDriverException(Exception):
+        pass
+
+    _SELENIUM_IMPORT_ERROR = _exc
+
 import requests
-import chromedriver_autoinstaller
+try:
+    import chromedriver_autoinstaller
+    _CHROMEDRIVER_AUTOINSTALL_ERROR = None
+except ImportError as _exc:
+    chromedriver_autoinstaller = None
+    _CHROMEDRIVER_AUTOINSTALL_ERROR = _exc
 
 session = requests.Session()
 
@@ -350,6 +402,16 @@ def _is_safe_to_delete(driver_path):
     return bool(re.match(r"^\d+\.\d+\.\d+(\.\d+)?$", dirname))
 
 
+def _chrome_major_version():
+    """Return the installed Chrome major version (e.g. 125), or None.
+    Used by undetected-chromedriver to download the matching driver."""
+    try:
+        full = chromedriver_autoinstaller.get_chrome_version()
+        return int(full.split(".")[0])
+    except Exception:
+        return None
+
+
 def _create_standard_driver(user_agent):
     """Standard Selenium + chromedriver-autoinstaller path."""
     driver_path = install_chromedriver()
@@ -388,11 +450,34 @@ def _safe_truncate(value, limit=80):
     return text if len(text) <= limit else text[:limit] + "..."
 
 
+def _require_selenium():
+    """
+    Browser-flow entry guard: raise a friendly error if selenium or
+    chromedriver_autoinstaller failed to import at module load time.
+    EU users (REST API path) never reach this; this protects only the
+    paths that actually need a browser.
+    """
+    if _SELENIUM_IMPORT_ERROR is not None:
+        raise RuntimeError(
+            "Browser-based flow requires selenium, but it failed to import: "
+            f"{_SELENIUM_IMPORT_ERROR}. Run 'python -m pip install -r "
+            "requirements.txt' to install all dependencies."
+        )
+    if _CHROMEDRIVER_AUTOINSTALL_ERROR is not None:
+        raise RuntimeError(
+            "Browser-based flow requires chromedriver-autoinstaller, but it "
+            f"failed to import: {_CHROMEDRIVER_AUTOINSTALL_ERROR}. Run "
+            "'python -m pip install -r requirements.txt' to install all "
+            "dependencies."
+        )
+
+
 def create_driver(user_agent):
     """
     Install chromedriver and start Chrome with anti-detection flags.
     Raises RuntimeError if Chrome cannot be started.
     """
+    _require_selenium()
     return _create_standard_driver(user_agent)
 
 
@@ -450,25 +535,92 @@ def select_region_and_brand():
 
 # ---------------------------------------------------------------------------
 # Kia EU Direct-API constants (sourced from hyundai_kia_connect_api HEAD).
-# These mimic the official Android app and are used only by Mode 4.
+# These mimic the official Android app. Values verbatim from
+# hyundai_kia_connect_api (HEAD) and bluelink-refresh-token.
 # ---------------------------------------------------------------------------
-KIA_EU_CCSP_SERVICE_ID = "fdc85c00-0a2f-4c64-bcb4-2cfb1500730a"
-KIA_EU_APP_ID = "a2b8469b-30a3-4361-8e13-6fceea8fbe74"
-KIA_EU_CLIENT_SECRET = "secret"
-KIA_EU_BASIC_AUTH = (
-    "Basic ZmRjODVjMDAtMGEyZi00YzY0LWJjYjQtMmNmYjE1MDA3MzBhOnNlY3JldA=="
-)
-KIA_EU_CFB = base64.b64decode(
-    "wLTVxwidmH8CfJYBWSnHD6E0huk0ozdiuygB4hLkM5XCgzAL1Dk5sE36d/bx5PFMbZs="
-)
-KIA_EU_OKHTTP_UA = "okhttp/3.12.0"
+
+# Per-brand EU configuration. Both Kia and Hyundai EU use the same
+# OAuth flow shape — only host names, IDs, and the redirect URI differ.
+KIA_EU_BRAND_CONFIG = {
+    "name": "Kia EU",
+    "host": "https://idpconnect-eu.kia.com",
+    "client_id": "fdc85c00-0a2f-4c64-bcb4-2cfb1500730a",
+    "client_secret": "secret",
+    "redirect_uri": "https://prd.eu-ccapi.kia.com:8080/api/v1/user/oauth2/redirect",
+    "token_url": "https://idpconnect-eu.kia.com/auth/api/v2/user/oauth2/token",
+    # Marketing client used by Probe 3 (cookie-priming via the kia.com
+    # online-sales OAuth client). Same IdP host but a different OAuth
+    # client; signin against this client returns a code redirected to
+    # kia.com — discarded — but the IdP session cookies stay on the
+    # session and let us then attempt the CCSP authorize endpoint.
+    "marketing_client_id": "peukiaidm-online-sales",
+    "marketing_redirect_uri": "https://www.kia.com/api/bin/oneid/login",
+    # Backend realm host for Probe 5 (Keycloak realm hidden behind the
+    # public-facing public IdP). Sourced from the JWT iss field of
+    # tokens issued by Probes 1-3.
+    "backend_realm_url": "https://eu-account.kia.com/auth/realms/eukiaidm",
+}
+
+HYUNDAI_EU_BRAND_CONFIG = {
+    "name": "Hyundai EU",
+    "host": "https://idpconnect-eu.hyundai.com",
+    "client_id": "6d477c38-3ca4-4cf3-9557-2a1929a94654",
+    # Hyundai's secret is a real value (Kia's is literally "secret"),
+    # publicly known via the open-source community.
+    "client_secret": "KUy49XxPzLpLuoK0xhBC77W6VXhmtQR9iQhmIFjjoY4IpxsV",
+    # Hyundai redirect ends in /token, Kia ends in /redirect — gotcha.
+    "redirect_uri": "https://prd.eu-ccapi.hyundai.com:8080/api/v1/user/oauth2/token",
+    "token_url": "https://idpconnect-eu.hyundai.com/auth/api/v2/user/oauth2/token",
+    "marketing_client_id": "peuhyundaiidm-ctb",
+    "marketing_redirect_uri": "https://ctbapi.hyundai-europe.com/api/auth",
+    # Mirror of the Kia backend-realm naming convention; not yet
+    # confirmed against a Hyundai JWT iss field, so Probe 5 may
+    # NXDOMAIN here. Logged as "no result" if so.
+    "backend_realm_url": "https://eu-account.hyundai.com/auth/realms/euhyundaiidm",
+}
+
+# Pool of TLS impersonation profiles for curl_cffi. We keep this list
+# to widely-supported baseline profiles (no `_android` suffix) because
+# specific mobile/version variants only exist in some curl_cffi build
+# combinations. The Windows wheel of curl_cffi 0.15.0, for example,
+# rejects `chrome124_android` even though Linux 0.15.0 accepts it.
+# `chrome` is the safest — it's an alias for "latest available" and
+# always present.
+TLS_IMPERSONATE_POOL = [
+    "chrome",
+    "chrome131",
+    "chrome124",
+    "chrome120",
+    "chrome116",
+    "safari17_0",
+    "safari17_2_ios",
+]
 
 
-def _kia_eu_stamp():
-    """Generate the Stamp header expected by the Kia EU CCSP backend."""
-    raw = f"{KIA_EU_APP_ID}:{int(dt.datetime.now().timestamp())}".encode()
-    result = bytes(b1 ^ b2 for b1, b2 in zip(KIA_EU_CFB, raw))
-    return base64.b64encode(result).decode("utf-8")
+# ---------------------------------------------------------------------------
+# Candidate client_ids for the realm-level probes. Mix of known and
+# speculative. Each entry is (client_id, client_secret_or_None, comment).
+# ---------------------------------------------------------------------------
+BACKEND_CLIENT_CANDIDATES = [
+    ("fdc85c00-0a2f-4c64-bcb4-2cfb1500730a", "secret",
+     "primary mobile-app client"),
+    ("peukiaidm-online-sales", None,
+     "alternate web client (no secret)"),
+    ("account", None,
+     "Keycloak default account console client"),
+    ("account-console", None,
+     "Keycloak default account console client (newer naming)"),
+    ("admin-cli", None,
+     "Keycloak default admin-cli"),
+    ("kia-connect", None,
+     "speculative"),
+    ("kia-connect-app", None,
+     "speculative"),
+    ("eukiaidm-connect-app", None,
+     "speculative"),
+    ("eukiaidm-app", None,
+     "speculative"),
+]
 
 
 def _direct_log(log_path, text):
@@ -493,20 +645,20 @@ def _log_response(log_path, label, response):
     _direct_log(log_path, f"  [{label}] body[:500]: {_safe_truncate(body, 500)}")
 
 
-def _exchange_code_for_tokens(session_obj, code, log_path):
-    """Use the IdP token endpoint (not WAF-protected) to swap a code for tokens."""
-    url = "https://idpconnect-eu.kia.com/auth/api/v2/user/oauth2/token"
+def _exchange_code_for_tokens(s, code, brand_config, log_path):
+    """Use the IdP token endpoint (not gated) to swap a code for tokens."""
+    url = brand_config["token_url"]
     data = {
         "grant_type": "authorization_code",
         "code": code,
-        "redirect_uri": "https://prd.eu-ccapi.kia.com:8080/api/v1/user/oauth2/redirect",
-        "client_id": KIA_EU_CCSP_SERVICE_ID,
-        "client_secret": KIA_EU_CLIENT_SECRET,
+        "redirect_uri": brand_config["redirect_uri"],
+        "client_id": brand_config["client_id"],
+        "client_secret": brand_config["client_secret"],
     }
     _direct_log(log_path, f"\n  [Token exchange] POST {url}")
     try:
-        resp = session_obj.post(url, data=data, timeout=30)
-    except requests.RequestException as e:
+        resp = s.post(url, data=data, timeout=30)
+    except Exception as e:
         _direct_log(log_path, f"  [Token exchange] network error: {e}")
         return None
     _log_response(log_path, "Token exchange", resp)
@@ -519,258 +671,2019 @@ def _exchange_code_for_tokens(session_obj, code, log_path):
         return None
 
 
-def _form_signin(session_obj, client_id, redirect_uri, email, password, log_path, label):
+def _prime_session_cookies(s, brand_config, log_path):
     """
-    POST credentials to /auth/account/signin (NOT WAF-blocked). Returns
-    the authorization code from the redirect Location, or None.
+    GET the authorize endpoint to seed initial session cookies. This
+    is what the official mobile app does first; some IdP backends
+    won't accept a signin POST without these cookies present.
+    Best-effort — failures are logged but not fatal (the legacy
+    fallback can still try without primed cookies).
+    """
+    url = (
+        f"{brand_config['host']}/auth/api/v2/user/oauth2/authorize"
+        f"?response_type=code&client_id={brand_config['client_id']}"
+        f"&redirect_uri={brand_config['redirect_uri']}"
+        "&lang=en&state=ccsp&country=de"
+    )
+    _direct_log(log_path, f"\n  [Cookie prime] GET {url}")
+    try:
+        resp = s.get(url, timeout=30, allow_redirects=True)
+        cookie_count = len(s.cookies) if hasattr(s, "cookies") else 0
+        _direct_log(
+            log_path,
+            f"  [Cookie prime] status={resp.status_code} cookies_set={cookie_count}",
+        )
+    except Exception as e:
+        _direct_log(log_path, f"  [Cookie prime] exception: {e}")
 
-    User-Agent comes from the session (set by kia_eu_direct_probe) so
-    the rotation is consistent within a single run.
+
+def _import_rsa():
     """
-    url = "https://idpconnect-eu.kia.com/auth/account/signin"
+    Lazy-import pycryptodome's RSA + PKCS1_v1_5. Raises a clean
+    RuntimeError with install hint if the package is missing,
+    instead of an opaque ImportError traceback.
+    """
+    try:
+        from Crypto.PublicKey import RSA
+        from Crypto.Cipher import PKCS1_v1_5
+        return RSA, PKCS1_v1_5
+    except ImportError as exc:
+        raise RuntimeError(
+            "EU direct mode requires pycryptodome for password encryption. "
+            "Install it with: python -m pip install pycryptodome"
+        ) from exc
+
+
+def _fetch_signin_pubkey(s, brand_config, log_path):
+    """
+    Fetch the IdP's RSA public key for password encryption. The endpoint
+    returns a JWK wrapped as `{"retValue": {"n":..., "e":..., "kid":...}}`.
+    Returns (RSA key, kid) or (None, None) on any failure.
+    """
+    url = f"{brand_config['host']}/auth/api/v1/accounts/certs"
+    _direct_log(log_path, f"\n  [JWK fetch] GET {url}")
+    try:
+        resp = s.get(url, timeout=30)
+    except Exception as e:
+        _direct_log(log_path, f"  [JWK fetch] network error: {e}")
+        return None, None
+    _log_response(log_path, "JWK fetch", resp)
+    if resp.status_code != 200:
+        return None, None
+    try:
+        body = resp.json()
+        jwk = body.get("retValue") or {}
+        if not jwk.get("n") or not jwk.get("e"):
+            _direct_log(log_path, "  [JWK fetch] missing 'n' or 'e' in retValue")
+            return None, None
+        n = int.from_bytes(base64.urlsafe_b64decode(jwk["n"] + "=="), "big")
+        e_val = int.from_bytes(base64.urlsafe_b64decode(jwk["e"] + "=="), "big")
+        RSA, _ = _import_rsa()
+        key = RSA.construct((n, e_val))
+        kid = jwk.get("kid", "")
+        _direct_log(
+            log_path,
+            f"  [JWK fetch] parsed key kid={kid or '(empty)'} "
+            f"modulus_bits={n.bit_length()}",
+        )
+        return key, kid
+    except (ValueError, KeyError, TypeError) as exc:
+        _direct_log(log_path, f"  [JWK fetch] parse error: {exc}")
+        return None, None
+
+
+def _rsa_encrypt(public_key, plaintext):
+    """PKCS#1 v1.5 RSA encrypt; return hex string (the format Kia EU expects)."""
+    _, PKCS1_v1_5 = _import_rsa()
+    cipher = PKCS1_v1_5.new(public_key)
+    return cipher.encrypt(plaintext.encode("utf-8")).hex()
+
+
+def _form_signin_app_flow(s, brand_config, email, password, log_path):
+    """
+    Modern app-flow signin: prime cookies, fetch RSA pubkey, send the
+    encrypted password. This is what the official Kia/Hyundai Connect
+    Android app does. Returns the authorization code on success, or
+    None if any step fails.
+    """
+    _prime_session_cookies(s, brand_config, log_path)
+    pubkey, kid = _fetch_signin_pubkey(s, brand_config, log_path)
+    if pubkey is None:
+        _direct_log(
+            log_path,
+            "  [App-flow] JWK unavailable — caller will fall back to legacy.",
+        )
+        return None
+    encrypted = _rsa_encrypt(pubkey, password)
+
+    url = f"{brand_config['host']}/auth/account/signin"
     data = {
-        "client_id": client_id,
+        "client_id": brand_config["client_id"],
+        "encryptedPassword": "true",
+        "password": encrypted,
+        "redirect_uri": brand_config["redirect_uri"],
+        "scope": "",
+        "nonce": "",
+        "state": "ccsp",
+        "username": email,
+        "connector_session_key": "",
+        "kid": kid,
+        "_csrf": "",
+    }
+    _direct_log(log_path, f"\n  [App-flow signin] POST {url}")
+    try:
+        resp = s.post(url, data=data, timeout=30, allow_redirects=False)
+    except Exception as exc:
+        _direct_log(log_path, f"  [App-flow signin] network error: {exc}")
+        return None
+    _log_response(log_path, "App-flow signin", resp)
+    if resp.status_code in (302, 303):
+        location = resp.headers.get("Location", "")
+        match = re.search(r"[?&]code=([^&]+)", location)
+        if match:
+            return match.group(1)
+        if "error_description=" in location or "/error?" in location:
+            _direct_log(
+                log_path,
+                "  [App-flow signin] IdP returned an error page (often: bad credentials).",
+            )
+        elif "/authorize" in location:
+            _direct_log(
+                log_path,
+                "  [App-flow signin] IdP redirected back to login (often: bad credentials).",
+            )
+    return None
+
+
+def _form_signin_legacy(s, brand_config, email, password, log_path):
+    """
+    Defensive fallback signin using `encryptedPassword=false`. Sends
+    the password in the form body. Currently still accepted by the
+    Kia/Hyundai EU IdP (December 2026), but if the JWK endpoint goes
+    down or the encrypted flow is rejected, this path may still get
+    a code. Will likely break first if this gets stricter.
+    """
+    url = f"{brand_config['host']}/auth/account/signin"
+    data = {
+        "client_id": brand_config["client_id"],
         "encryptedPassword": "false",
         "username": email,
         "password": password,
-        "redirect_uri": redirect_uri,
+        "redirect_uri": brand_config["redirect_uri"],
         "state": "ccsp",
         "remember_me": "false",
     }
-    headers = {
-        "Content-Type": "application/x-www-form-urlencoded",
-        "Origin": "https://idpconnect-eu.kia.com",
-        "Referer": "https://idpconnect-eu.kia.com/",
-    }
+    _direct_log(log_path, f"\n  [Legacy signin] POST {url}")
     try:
-        resp = session_obj.post(
-            url, data=data, headers=headers, timeout=30, allow_redirects=False
-        )
+        resp = s.post(url, data=data, timeout=30, allow_redirects=False)
+    except Exception as exc:
+        _direct_log(log_path, f"  [Legacy signin] network error: {exc}")
+        return None
+    _log_response(log_path, "Legacy signin", resp)
+    if resp.status_code in (302, 303):
+        location = resp.headers.get("Location", "")
+        match = re.search(r"[?&]code=([^&]+)", location)
+        if match:
+            return match.group(1)
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Probe 3: cross-client session reuse. Sign in via one client, then
+# immediately authorize against another in the same HTTP session.
+# ---------------------------------------------------------------------------
+def _probe_marketing_to_ccsp(s, brand_config, email, password, log_path):
+    """
+    Probe 3 (HISTORICAL — confirmed not working as of v3.3.0 debug
+    run on 2026-04-28): sign in via the marketing OAuth client to
+    seed cookies, then use the same session to GET the CCSP authorize
+    endpoint. Returns a CCSP authorization code on success, or None.
+
+    Why we keep it: the marketing-cookie-reuse trick was a plausible
+    workaround for IdP on the CCSP authorize endpoint (after
+    a marketing signin we have aws-waf-token + KEYCLOAK_IDENTITY
+    cookies that should make us look like a legit returning user).
+    Empirically the IdP deletes those cookies on the next request
+    (Set-Cookie Max-Age=0) and 302-loops the authorize URL.
+
+    Kept in the chain anyway because: (a) zero cost when probes 0-2
+    have already won and we early-return, (b) future Kia config
+    changes might re-open the path, (c) the diagnostic log lines
+    from this probe are valuable for confirming the IdP is still
+    behaving the same way.
+    """
+    if not brand_config.get("marketing_client_id"):
+        _direct_log(log_path, "  [Probe 3] no marketing_client_id configured, skipping.")
+        return None
+
+    # Step 1: marketing signin (NOT rejected) — we just want the cookies.
+    signin_url = f"{brand_config['host']}/auth/account/signin"
+    signin_data = {
+        "client_id": brand_config["marketing_client_id"],
+        "encryptedPassword": "false",
+        "username": email,
+        "password": password,
+        "redirect_uri": brand_config["marketing_redirect_uri"],
+        "state": "ccsp",
+        "remember_me": "false",
+    }
+    _direct_log(log_path, f"\n  [Probe 3 — Marketing signin] POST {signin_url}")
+    try:
+        resp = s.post(signin_url, data=signin_data, timeout=30, allow_redirects=False)
+    except Exception as exc:
+        _direct_log(log_path, f"  [Probe 3 signin] network error: {exc}")
+        return None
+    _log_response(log_path, "Probe 3 — Marketing signin", resp)
+    if resp.status_code not in (302, 303):
+        _direct_log(log_path, "  [Probe 3] marketing signin failed (likely bad creds), aborting.")
+        return None
+
+    # Now we have IdP session cookies + aws-waf-token on the session.
+    # Try the CCSP authorize URL — first normally, then with prompt=none
+    # (silent SSO; some IdPs whitelist this because it's machine-to-
+    # machine by design).
+    ccsp_authorize_base = (
+        f"{brand_config['host']}/auth/api/v2/user/oauth2/authorize"
+        f"?response_type=code&client_id={brand_config['client_id']}"
+        f"&redirect_uri={brand_config['redirect_uri']}"
+        "&lang=en&state=ccsp"
+    )
+
+    for label, url in (
+        ("Probe 3 — CCSP authorize", ccsp_authorize_base),
+        ("Probe 3 — CCSP authorize (prompt=none)", ccsp_authorize_base + "&prompt=none"),
+    ):
+        _direct_log(log_path, f"\n  [{label}] GET {url}")
+        try:
+            resp = s.get(url, timeout=30, allow_redirects=False)
+        except Exception as exc:
+            _direct_log(log_path, f"  [{label}] network error: {exc}")
+            continue
         _log_response(log_path, label, resp)
         if resp.status_code in (302, 303):
             location = resp.headers.get("Location", "")
             match = re.search(r"[?&]code=([^&]+)", location)
             if match:
+                _direct_log(log_path, f"  [{label}] got CCSP code via cookie reuse.")
                 return match.group(1)
-    except Exception as e:
-        _direct_log(log_path, f"  [{label}] exception: {e}")
+            if "/error" in location or "error=" in location:
+                _direct_log(log_path, f"  [{label}] rejected (redirect to error).")
     return None
 
 
-def kia_eu_direct_probe(email, password, log_path):
+# ---------------------------------------------------------------------------
+# Probe 4: OIDC discovery + ROPC. Reads /.well-known/openid-configuration
+# and tries any supported password grant.
+# ---------------------------------------------------------------------------
+def _probe_oidc_discovery(s, brand_config, email, password, log_path):
     """
-    Try several non-browser approaches to obtain a Kia EU refresh_token.
-    Each probe is logged in detail to log_path. Returns a token dict
-    (with 'refresh_token' and 'access_token') if any probe succeeds,
-    else None.
+    Probe 4 (HISTORICAL — confirmed not useful as of v3.3.0 debug run
+    on 2026-04-28): fetch /.well-known/openid-configuration on the
+    public IdP and try ROPC at any advertised token_endpoint that
+    supports grant_type=password.
 
-    The probes are deliberately ordered cheapest-and-most-promising
-    first: ROPC at the IdP token endpoint (which is not WAF-protected),
-    then the legacy form-based signin endpoint, then the CCSP-side
-    authorize endpoint as a cookie-priming + redirect-following test.
+    Why it doesn't work: the public IdP at idpconnect-eu.kia.com hides
+    OIDC discovery — the well-known URL returns 404. So we never get
+    metadata to act on. The backend realm (Probe 5) DOES expose
+    discovery, but that's covered there.
+
+    Kept in the chain because: (a) zero cost on success-from-probe-N<4,
+    (b) if turns on discovery on the public IdP we'd
+    automatically see the new endpoints, (c) the 404 itself is a
+    useful confirmation in the debug log.
+
+    Returns a token dict on success, None otherwise. (Returns full
+    tokens directly because OIDC ROPC bypasses the code-exchange
+    step entirely.)
     """
+    discovery_url = f"{brand_config['host']}/.well-known/openid-configuration"
+    _direct_log(log_path, f"\n  [Probe 4 — OIDC discovery] GET {discovery_url}")
+    try:
+        resp = s.get(discovery_url, timeout=30)
+    except Exception as exc:
+        _direct_log(log_path, f"  [Probe 4 discovery] network error: {exc}")
+        return None
+    if resp.status_code != 200:
+        _log_response(log_path, "Probe 4 discovery", resp)
+        return None
+    try:
+        config = resp.json()
+    except ValueError:
+        _direct_log(log_path, "  [Probe 4 discovery] body not JSON")
+        return None
+
+    # Log everything interesting about what Kia advertises.
+    interesting_keys = (
+        "issuer",
+        "authorization_endpoint",
+        "token_endpoint",
+        "device_authorization_endpoint",
+        "userinfo_endpoint",
+        "introspection_endpoint",
+        "revocation_endpoint",
+        "end_session_endpoint",
+        "jwks_uri",
+        "grant_types_supported",
+        "response_types_supported",
+        "scopes_supported",
+        "token_endpoint_auth_methods_supported",
+    )
+    _direct_log(log_path, "  [Probe 4 discovery] advertised metadata:")
+    for key in interesting_keys:
+        if key in config:
+            _direct_log(log_path, f"    {key}: {_safe_truncate(config[key], 200)}")
+
+    if config.get("device_authorization_endpoint"):
+        _direct_log(
+            log_path,
+            "  [Probe 4 discovery] device_authorization_endpoint present — "
+            "future feature: implement device-flow login.",
+        )
+
+    grant_types = config.get("grant_types_supported", []) or []
+    token_endpoint = config.get("token_endpoint")
+    if not token_endpoint or "password" not in grant_types:
+        _direct_log(
+            log_path,
+            "  [Probe 4 discovery] ROPC not advertised (or no token_endpoint), nothing to try.",
+        )
+        return None
+
+    # Discovery says ROPC is supported. Attempt it.
     _direct_log(
         log_path,
-        f"\n=== Kia EU Direct API Probe — {dt.datetime.now():%Y-%m-%d %H:%M:%S} ===",
+        f"\n  [Probe 4 — ROPC] POST {token_endpoint} grant_type=password",
     )
-    _direct_log(log_path, f"Email: {email}")
-
-    # Pick a random browser UA per run so consecutive users of the
-    # script don't all share the exact same fingerprint at the IdP.
-    # All requests in this session use the same UA (one user, one
-    # browser, one session — what real traffic looks like).
-    chosen_ua = random.choice(BROWSER_UA_POOL)
-    _direct_log(log_path, f"User-Agent: {chosen_ua}")
-
-    s = requests.Session()
-    s.headers.update({
-        "Accept-Encoding": "gzip",
-        "User-Agent": chosen_ua,
-    })
-
-    # ----------------------------------------------------------------
-    # Probe 1: OAuth2 Resource-Owner-Password-Credentials grant against
-    # the IdP token endpoint. Token endpoints are typically NOT behind
-    # WAF Bot Control because they're machine-to-machine. If the IdP
-    # supports ROPC, this returns access_token + refresh_token directly
-    # with no Authorize step needed.
-    # ----------------------------------------------------------------
-    _direct_log(log_path, "\n--- Probe 1: IdP token endpoint, grant_type=password (ROPC) ---")
     try:
-        url = "https://idpconnect-eu.kia.com/auth/api/v2/user/oauth2/token"
+        resp = s.post(
+            token_endpoint,
+            data={
+                "grant_type": "password",
+                "username": email,
+                "password": password,
+                "client_id": brand_config["client_id"],
+                "client_secret": brand_config["client_secret"],
+                "scope": "openid profile email phone",
+            },
+            timeout=30,
+        )
+    except Exception as exc:
+        _direct_log(log_path, f"  [Probe 4 ROPC] network error: {exc}")
+        return None
+    _log_response(log_path, "Probe 4 ROPC", resp)
+    if resp.status_code != 200:
+        return None
+    try:
+        tokens = resp.json()
+    except ValueError:
+        return None
+    if tokens.get("refresh_token") and tokens.get("access_token"):
+        return tokens
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Probe 5: standard Keycloak OIDC discovery + ROPC sweep at the
+# realm advertised in the JWT `iss` claim.
+# ---------------------------------------------------------------------------
+def _backend_realm_discover(s, brand_config, log_path):
+    """
+    Fetch backend realm OIDC metadata. Returns the parsed config dict
+    on success, None on any failure. Also logs interesting metadata.
+    """
+    realm_url = brand_config.get("backend_realm_url")
+    if not realm_url:
+        _direct_log(log_path, "  [Probe 5] no backend_realm_url configured, skipping.")
+        return None
+
+    discovery_url = f"{realm_url}/.well-known/openid-configuration"
+    _direct_log(log_path, f"\n  [Probe 5 — Backend realm discovery] GET {discovery_url}")
+    try:
+        resp = s.get(discovery_url, timeout=15)
+    except Exception as exc:
+        _direct_log(
+            log_path,
+            f"  [Probe 5 discovery] network error: {exc} "
+            "(backend realm may not be public-facing — expected for some setups)",
+        )
+        return None
+    if resp.status_code != 200:
+        _log_response(log_path, "Probe 5 discovery", resp)
+        return None
+
+    try:
+        config = resp.json()
+    except ValueError:
+        _direct_log(log_path, "  [Probe 5 discovery] body not JSON")
+        return None
+
+    _direct_log(log_path, "  [Probe 5 discovery] backend realm REACHABLE — metadata:")
+    for key in (
+        "issuer",
+        "token_endpoint",
+        "authorization_endpoint",
+        "device_authorization_endpoint",
+        "grant_types_supported",
+        "token_endpoint_auth_methods_supported",
+    ):
+        if key in config:
+            _direct_log(log_path, f"    {key}: {_safe_truncate(config[key], 200)}")
+
+    return config
+
+
+def _probe_backend_realm(s, brand_config, email, password, log_path):
+    """
+    Probe 5: enumerate Client-IDs at the backend Keycloak realm.
+
+    The v3.3.0 debug-all run confirmed that:
+      - The backend realm at eu-account.kia.com IS publicly reachable
+      - It advertises grant_types_supported including 'password' (ROPC)
+        and 'urn:ietf:params:oauth:grant-type:device_code'
+      - But the public IdP client_id "fdc85c00..." is NOT registered there
+        (returns "invalid_client")
+
+    So we sweep BACKEND_CLIENT_CANDIDATES — each candidate is a (client_id,
+    secret) pair we try with grant_type=password. The error code that
+    comes back tells us about each client:
+      - "invalid_client"     → client_id doesn't exist at this realm
+      - "unauthorized_client"→ client exists but ROPC not enabled for it
+      - "invalid_grant"      → client EXISTS, ROPC enabled, but the
+                               username/password combination didn't auth
+                               (or the user needs MFA, etc.) — that's
+                               still a major finding because it means
+                               the client is real
+      - 200 + tokens         → JACKPOT — fully standalone path
+    """
+    config = _backend_realm_discover(s, brand_config, log_path)
+    if not config:
+        return None
+
+    token_endpoint = config.get("token_endpoint")
+    if not token_endpoint:
+        return None
+
+    grant_types = config.get("grant_types_supported", []) or []
+    if "password" not in grant_types:
+        _direct_log(
+            log_path,
+            "  [Probe 5] backend realm doesn't advertise ROPC, nothing to try.",
+        )
+        return None
+
+    _direct_log(
+        log_path,
+        f"\n  [Probe 5 — Backend ROPC] sweeping {len(BACKEND_CLIENT_CANDIDATES)} client_id candidates at {token_endpoint}",
+    )
+
+    found_existing = []  # [(client_id, error)] for clients that exist but failed auth
+
+    for client_id, client_secret, comment in BACKEND_CLIENT_CANDIDATES:
         data = {
             "grant_type": "password",
             "username": email,
             "password": password,
-            "client_id": KIA_EU_CCSP_SERVICE_ID,
-            "client_secret": KIA_EU_CLIENT_SECRET,
+            "client_id": client_id,
             "scope": "openid profile email phone",
         }
-        resp = s.post(url, data=data, timeout=30, allow_redirects=False)
-        _log_response(log_path, "Probe 1", resp)
+        if client_secret is not None:
+            data["client_secret"] = client_secret
+
+        secret_label = "(secret)" if client_secret else "(public)"
+        _direct_log(
+            log_path,
+            f"\n    [Probe 5 try] client_id={client_id} {secret_label}  [{comment}]",
+        )
+        try:
+            resp = s.post(token_endpoint, data=data, timeout=15)
+        except Exception as exc:
+            _direct_log(log_path, f"      network error: {exc}")
+            continue
+
         if resp.status_code == 200:
             try:
                 tokens = resp.json()
-                if tokens.get("refresh_token") and tokens.get("access_token"):
-                    _direct_log(log_path, "  [JACKPOT] Probe 1 returned tokens.")
-                    return tokens
             except ValueError:
-                pass
-    except Exception as e:
-        _direct_log(log_path, f"  [Probe 1] exception: {e}")
+                _direct_log(log_path, "      200 but body not JSON")
+                continue
+            if tokens.get("refresh_token") and tokens.get("access_token"):
+                _direct_log(
+                    log_path,
+                    f"      [JACKPOT] {client_id} accepted credentials — "
+                    "fully standalone path.",
+                )
+                return tokens
+            _direct_log(log_path, "      200 but no tokens in response")
+            continue
 
-    # ----------------------------------------------------------------
-    # Probe 2a: Form-based signin using the CCSP client_id directly.
-    # Earlier diagnostic showed signin works, but a code issued for the
-    # marketing client cannot be exchanged at the CCSP token endpoint
-    # (OAuth requires redirect_uri at authorize and exchange to match).
-    # Asking signin to issue a code FOR the CCSP client + CCSP
-    # redirect_uri lets the regular exchange work end-to-end.
-    # ----------------------------------------------------------------
-    _direct_log(
-        log_path,
-        "\n--- Probe 2a: signin with CCSP client_id (the killer attempt) ---",
-    )
-    code = _form_signin(
-        s,
-        KIA_EU_CCSP_SERVICE_ID,
-        "https://prd.eu-ccapi.kia.com:8080/api/v1/user/oauth2/redirect",
-        email,
-        password,
-        log_path,
-        "Probe 2a",
-    )
-    if code:
-        _direct_log(log_path, f"  [Probe 2a] Got code for CCSP client, exchanging…")
-        tokens = _exchange_code_for_tokens(s, code, log_path)
-        if tokens and tokens.get("refresh_token") and tokens.get("access_token"):
-            _direct_log(log_path, "  [JACKPOT] Probe 2a returned tokens.")
-            return tokens
+        # Non-200: parse error code from response body to classify the failure.
+        body = resp.text or ""
+        error = ""
+        try:
+            err_json = resp.json()
+            error = err_json.get("error", "")
+        except ValueError:
+            pass
 
-    # ----------------------------------------------------------------
-    # Probe 2b: Marketing-client signin (control case). We already know
-    # this returns a code. Useful only as a sanity check that the
-    # signin endpoint is alive in this session — without the marketing
-    # client_secret we can't exchange the code for tokens.
-    # ----------------------------------------------------------------
-    _direct_log(
-        log_path,
-        "\n--- Probe 2b: signin with marketing client_id (control, no exchange) ---",
-    )
-    code = _form_signin(
-        s,
-        "peukiaidm-online-sales",
-        "https://www.kia.com/api/bin/oneid/login",
-        email,
-        password,
-        log_path,
-        "Probe 2b",
-    )
-    if code:
+        if error == "invalid_client":
+            _direct_log(log_path, f"      → invalid_client (client unknown at backend)")
+        elif error == "unauthorized_client":
+            _direct_log(
+                log_path,
+                f"      → unauthorized_client (CLIENT EXISTS but ROPC not enabled for it)",
+            )
+            found_existing.append((client_id, "ROPC disabled"))
+        elif error == "invalid_grant":
+            _direct_log(
+                log_path,
+                f"      → invalid_grant (CLIENT EXISTS — credentials wrong, or MFA required)",
+            )
+            found_existing.append((client_id, "credentials rejected"))
+        else:
+            _direct_log(
+                log_path,
+                f"      → status={resp.status_code} error={error or 'unknown'} "
+                f"body[:200]={_safe_truncate(body, 200)}",
+            )
+
+    # No success, but log any "real" clients we found
+    if found_existing:
+        _direct_log(log_path, "\n  [Probe 5] EXISTING backend clients discovered:")
+        for cid, reason in found_existing:
+            _direct_log(log_path, f"    - {cid} ({reason})")
         _direct_log(
             log_path,
-            f"  [Probe 2b] Got marketing code (cannot exchange — no marketing secret).",
+            "  These would work if we had the right secret / second factor / "
+            "authorization. Future-feature opportunity.",
+        )
+    else:
+        _direct_log(
+            log_path,
+            "  [Probe 5] None of the candidate client_ids are registered at the backend realm.",
+        )
+
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Probe 6: device-flow (RFC 8628) discovery at the realm. Discovery
+# only in the chained run; interactive completion via --device-flow.
+# ---------------------------------------------------------------------------
+def _probe_device_flow_discover(s, brand_config, log_path):
+    """
+    Initiate device flow against backend realm with each candidate
+    client_id. Returns a list of usable
+    {client_id, device_code, user_code, verification_uri,
+     verification_uri_complete, expires_in, interval} dicts (empty if
+    none worked). Does NOT poll — see _interactive_device_flow_complete.
+    """
+    config = _backend_realm_discover(s, brand_config, log_path)
+    if not config:
+        return []
+
+    device_endpoint = config.get("device_authorization_endpoint")
+    if not device_endpoint:
+        _direct_log(
+            log_path,
+            "  [Probe 6] backend realm doesn't advertise device_authorization_endpoint",
+        )
+        return []
+
+    grant_types = config.get("grant_types_supported", []) or []
+    if "urn:ietf:params:oauth:grant-type:device_code" not in grant_types:
+        _direct_log(log_path, "  [Probe 6] device_code grant not advertised")
+        return []
+
+    _direct_log(
+        log_path,
+        f"\n  [Probe 6 — Device flow init] sweeping candidates at {device_endpoint}",
+    )
+
+    findings = []
+    for client_id, client_secret, comment in BACKEND_CLIENT_CANDIDATES:
+        data = {"client_id": client_id, "scope": "openid"}
+        if client_secret is not None:
+            data["client_secret"] = client_secret
+
+        secret_label = "(secret)" if client_secret else "(public)"
+        _direct_log(log_path, f"\n    [Probe 6 try] client_id={client_id} {secret_label}")
+        try:
+            # Explicit Accept header — Keycloak otherwise returns HTML
+            # if the client thinks it's a browser hitting an endpoint.
+            resp = s.post(
+                device_endpoint,
+                data=data,
+                headers={"Accept": "application/json"},
+                timeout=15,
+            )
+        except Exception as exc:
+            _direct_log(log_path, f"      network error: {exc}")
+            continue
+
+        if resp.status_code == 200:
+            try:
+                body = resp.json()
+            except ValueError:
+                # Keycloak gave us 200 but non-JSON. Log the actual
+                # body so we can see what it is (HTML login form?
+                # error page? empty?) — without this logging the
+                # mystery in v3.4.0 took 24h to solve.
+                content_type = resp.headers.get("Content-Type", "(no Content-Type)")
+                preview = _safe_truncate(resp.text or "(empty)", 300)
+                _direct_log(
+                    log_path,
+                    f"      200 but body not JSON; Content-Type={content_type} body[:300]={preview}",
+                )
+                continue
+            if not (body.get("device_code") and body.get("user_code")):
+                _direct_log(log_path, "      200 but missing device_code/user_code")
+                continue
+            finding = {
+                "client_id": client_id,
+                "client_secret": client_secret,
+                "device_code": body["device_code"],
+                "user_code": body["user_code"],
+                "verification_uri": body.get("verification_uri", ""),
+                "verification_uri_complete": body.get("verification_uri_complete")
+                                           or body.get("verification_uri", ""),
+                "expires_in": body.get("expires_in", 600),
+                "interval": body.get("interval", 5),
+                "token_endpoint": config.get("token_endpoint"),
+            }
+            findings.append(finding)
+            _direct_log(
+                log_path,
+                f"      [USABLE] device_code received, user_code={body['user_code']}, "
+                f"verification_uri={finding['verification_uri']}",
+            )
+            continue
+
+        # Non-200: classify
+        try:
+            err_json = resp.json()
+            err = err_json.get("error", "")
+        except ValueError:
+            err = ""
+        if err:
+            _direct_log(log_path, f"      → status={resp.status_code} error={err}")
+        else:
+            body_preview = _safe_truncate(resp.text or "", 200)
+            _direct_log(log_path, f"      → status={resp.status_code} body[:200]={body_preview}")
+
+    if findings:
+        _direct_log(
+            log_path,
+            f"\n  [Probe 6] {len(findings)} candidate(s) accepted device-flow init "
+            "— interactive flow available via --device-flow",
+        )
+    else:
+        _direct_log(log_path, "\n  [Probe 6] no client_id accepted device-flow init")
+    return findings
+
+
+def _interactive_device_flow_complete(s, finding, log_path):
+    """
+    Given a device-flow finding, present the verification URI to the
+    user and poll the token endpoint until they authenticate (or
+    expiration). Returns tokens dict on success, None on failure or
+    user-canceled.
+    """
+    print()
+    print("=" * 60)
+    print("DEVICE FLOW -- interactive login")
+    print("=" * 60)
+    print()
+    print("Open this URL in any browser (your phone is fine):")
+    print(f"  {finding['verification_uri_complete']}")
+    print()
+    if finding['user_code'] not in (finding['verification_uri_complete'] or ""):
+        print(f"If asked, enter this code: {finding['user_code']}")
+        print()
+    print(f"Log in with your Kia account on that page.")
+    print(f"This script will pick up automatically once you're done.")
+    print(f"(timeout: {finding['expires_in']}s, polling every {finding['interval']}s)")
+    print()
+    print("Press Ctrl+C to abort.")
+    print()
+
+    deadline = time.time() + finding["expires_in"]
+    interval = max(int(finding["interval"]), 1)
+    poll_data = {
+        "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
+        "device_code": finding["device_code"],
+        "client_id": finding["client_id"],
+    }
+    if finding.get("client_secret") is not None:
+        poll_data["client_secret"] = finding["client_secret"]
+
+    while time.time() < deadline:
+        try:
+            time.sleep(interval)
+        except KeyboardInterrupt:
+            print("\nDevice flow aborted by user.")
+            return None
+        try:
+            resp = s.post(finding["token_endpoint"], data=poll_data, timeout=15)
+        except Exception as exc:
+            _direct_log(log_path, f"  [Device flow poll] network error: {exc}")
+            print(".", end="", flush=True)
+            continue
+
+        if resp.status_code == 200:
+            try:
+                tokens = resp.json()
+            except ValueError:
+                continue
+            if tokens.get("refresh_token") and tokens.get("access_token"):
+                print("\n[OK] Device flow completed.")
+                _direct_log(log_path, "  [Device flow] SUCCESS — tokens received.")
+                return tokens
+            continue
+
+        try:
+            err_json = resp.json()
+            err = err_json.get("error", "")
+        except ValueError:
+            err = ""
+        if err == "authorization_pending":
+            print(".", end="", flush=True)
+            continue
+        if err == "slow_down":
+            interval += 1
+            print("(slowing down)", end=" ", flush=True)
+            continue
+        if err == "expired_token":
+            print("\n[ERROR] Device code expired -- start over.")
+            return None
+        if err == "access_denied":
+            print("\n[ERROR] Authorization denied on the verification page.")
+            return None
+        # Unknown error
+        body_preview = _safe_truncate(resp.text or "", 200)
+        print(f"\n[ERROR] Device flow polling returned status={resp.status_code} body={body_preview}")
+        return None
+
+    print("\n[ERROR] Device flow timed out without completion.")
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Probe 7: standard Keycloak authorization_code flow (headless form-post).
+# ---------------------------------------------------------------------------
+def _probe_backend_auth_code(s, brand_config, email, password, log_path):
+    """
+    Probe 7 (HISTORICAL — confirmed not viable as of v3.7.0 debug run
+    on 2026-04-28): try the standard Keycloak authorization_code flow
+    at the backend realm. Returns tokens dict on success, None
+    otherwise.
+
+    Why it doesn't work: the backend Keycloak login form has Google
+    reCAPTCHA v3 wired in (site key `6Ld2GsMrAAAAALfCHMn7fAVEK898yPTFQNYMmNss`).
+    The form embeds an `<input type="hidden" name="g-recaptcha-response">`
+    that must contain a valid Google-signed token before submission.
+    Without running Google's JS in a real browser, we cannot obtain
+    that token, and the backend rejects the POST with `recaptcha_failed_v3`.
+
+    This is by design: every browser-rendered Kia login surface (public IdP
+    UI + backend UI) enforces reCAPTCHA. The REST API at
+    /auth/account/signin (Probes 0-2) does NOT enforce reCAPTCHA — it's
+    designed for the official mobile app, which has its own attestation
+    (SafetyNet/Play Integrity) that signals "real device" without
+    needing a JS challenge. We piggyback on that REST endpoint.
+
+    Kept in the chain because: (a) zero cost on success-from-probe-N<7,
+    (b) if removes reCAPTCHA from the backend or adds a
+    different client without it, this probe would automatically pick
+    it up, (c) the diagnostic log makes the architectural picture
+    clear for future contributors.
+    """
+    realm_url = brand_config.get("backend_realm_url")
+    if not realm_url:
+        _direct_log(log_path, "  [Probe 7] no backend_realm_url configured, skipping.")
+        return None
+
+    # Use the marketing client_id since Probe 5 confirmed it exists at
+    # the backend. Marketing redirect_uri is also a known-valid value.
+    backend_client_id = brand_config.get("marketing_client_id")
+    backend_redirect = brand_config.get("marketing_redirect_uri")
+    if not backend_client_id or not backend_redirect:
+        _direct_log(log_path, "  [Probe 7] marketing client/redirect not configured, skipping.")
+        return None
+
+    auth_url = (
+        f"{realm_url}/protocol/openid-connect/auth"
+        f"?client_id={backend_client_id}"
+        "&response_type=code"
+        f"&redirect_uri={backend_redirect}"
+        "&state=ccsp"
+        "&scope=openid"
+    )
+
+    # ----------------------------------------------------------------
+    # Step 1: GET the authorize URL. Keycloak should render an HTML
+    # login form. If it instead redirects to the public IdP login, we're
+    # back in IdP territory — abort.
+    # ----------------------------------------------------------------
+    _direct_log(log_path, f"\n  [Probe 7 — Auth GET] GET {auth_url}")
+    try:
+        resp = s.get(auth_url, timeout=15, allow_redirects=False)
+    except Exception as exc:
+        _direct_log(log_path, f"  [Probe 7] auth GET network error: {exc}")
+        return None
+    _log_response(log_path, "Probe 7 auth GET", resp)
+
+    # If we get redirected, follow if it's still on the backend host.
+    # Bail if it goes to the public IdP (gated).
+    if resp.status_code in (302, 303):
+        location = resp.headers.get("Location", "")
+        if "idpconnect-eu" in location or "idpconnect-eu.hyundai" in location:
+            _direct_log(
+                log_path,
+                "  [Probe 7] backend authorize redirected to front-end IdP — dead end.",
+            )
+            return None
+        if not location:
+            return None
+        try:
+            resp = s.get(location, timeout=15, allow_redirects=False)
+        except Exception as exc:
+            _direct_log(log_path, f"  [Probe 7] auth follow network error: {exc}")
+            return None
+        _log_response(log_path, "Probe 7 auth GET (followed)", resp)
+
+    if resp.status_code != 200:
+        _direct_log(log_path, f"  [Probe 7] expected 200 with HTML, got {resp.status_code}")
+        return None
+
+    get_body = resp.text or ""
+
+    # ----------------------------------------------------------------
+    # Step 2: parse the form action URL. Keycloak's login form looks
+    # like <form id="kc-form-login" action="..." method="post">. The
+    # action URL embeds session/code parameters, so we have to extract
+    # it from the rendered HTML.
+    # ----------------------------------------------------------------
+    form_match = re.search(
+        r'<form[^>]+action=["\']([^"\']+)["\']',
+        get_body,
+        flags=re.IGNORECASE,
+    )
+    if not form_match:
+        _direct_log(
+            log_path,
+            f"  [Probe 7] no <form action=...> found in HTML response; "
+            f"body[:300]={_safe_truncate(get_body, 300)}",
+        )
+        return None
+
+    form_action = form_match.group(1).replace("&amp;", "&")
+    if not form_action.startswith("http"):
+        # relative URL — prepend host
+        from urllib.parse import urljoin
+        form_action = urljoin(auth_url, form_action)
+    _direct_log(log_path, f"  [Probe 7] login form action: {_safe_truncate(form_action, 200)}")
+
+    # Extract any hidden form fields from the GET body. Some Keycloak
+    # setups embed CSRF tokens / session continuations / locale hints
+    # as <input type="hidden"> in the login form, and silently reject
+    # POSTs that don't echo them back.
+    hidden_fields = {}
+    for m in re.finditer(
+        r'<input\s+[^>]*type=["\']hidden["\'][^>]*>',
+        get_body,
+        flags=re.IGNORECASE,
+    ):
+        tag = m.group(0)
+        name_m = re.search(r'name=["\']([^"\']+)["\']', tag, re.IGNORECASE)
+        value_m = re.search(r'value=["\']([^"\']*)["\']', tag, re.IGNORECASE)
+        if name_m:
+            hidden_fields[name_m.group(1)] = value_m.group(1) if value_m else ""
+    if hidden_fields:
+        _direct_log(
+            log_path,
+            f"  [Probe 7] extracted {len(hidden_fields)} hidden form field(s): "
+            f"{list(hidden_fields.keys())}",
         )
 
     # ----------------------------------------------------------------
-    # Probe 3: CCSP authorize endpoint on port 8080. Different host
-    # than the WAF-blocked IdP authorize URL. With the right Stamp +
-    # ccsp-* headers (mimicking the Android app), this might either
-    # issue a code directly or redirect to a still-alive auth path.
+    # Step 3: POST credentials to the form action. Keycloak's standard
+    # credential submission expects username + password (and optionally
+    # credentialId — empty is fine). Also include any hidden fields
+    # captured from the GET response, plus the locale hint.
     # ----------------------------------------------------------------
-    _direct_log(log_path, "\n--- Probe 3: CCSP authorize endpoint with app headers ---")
+    post_data = dict(hidden_fields)  # start with whatever hidden fields the form had
+    post_data.update({
+        "username": email,
+        "password": password,
+        "credentialId": post_data.get("credentialId", ""),
+        # Keycloak's submit button is `<input name="login" value="Sign In">`.
+        # Some Keycloak setups validate that this field is present —
+        # without it the form may be treated as a synthetic submit.
+        "login": "Sign In",
+        # Locale hint — some Keycloak themes require it for the login
+        # to dispatch to the right credential validator.
+        "kc_locale": post_data.get("kc_locale", "en"),
+    })
+
+    _direct_log(log_path, f"\n  [Probe 7 — Login POST] data fields: {sorted(post_data.keys())}")
     try:
-        url = (
-            "https://prd.eu-ccapi.kia.com:8080/api/v1/user/oauth2/authorize"
-            f"?response_type=code&client_id={KIA_EU_CCSP_SERVICE_ID}"
-            "&redirect_uri=https://prd.eu-ccapi.kia.com:8080/api/v1/user/oauth2/redirect"
-            "&state=ccsp&lang=en"
+        resp = s.post(
+            form_action,
+            data=post_data,
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            timeout=15,
+            allow_redirects=False,
         )
-        headers = {
-            "User-Agent": KIA_EU_OKHTTP_UA,
-            "Stamp": _kia_eu_stamp(),
-            "ccsp-service-id": KIA_EU_CCSP_SERVICE_ID,
-            "ccsp-application-id": KIA_EU_APP_ID,
-            "Authorization": KIA_EU_BASIC_AUTH,
-            "Host": "prd.eu-ccapi.kia.com:8080",
-        }
-        resp = s.get(url, headers=headers, timeout=30, allow_redirects=False)
-        _log_response(log_path, "Probe 3", resp)
-    except Exception as e:
-        _direct_log(log_path, f"  [Probe 3] exception: {e}")
+    except Exception as exc:
+        _direct_log(log_path, f"  [Probe 7] login POST network error: {exc}")
+        return None
+    _log_response(log_path, "Probe 7 login POST", resp)
+
+    if resp.status_code not in (302, 303):
+        # Keycloak re-rendered the login form with an embedded error.
+        # Search the FULL post body (not just first 1000 chars) for any
+        # of the known Keycloak error patterns.
+        post_body = resp.text or ""
+        error_msg = None
+        for pattern in (
+            r'<span[^>]+class=["\'][^"\']*kc-feedback-text[^"\']*["\'][^>]*>\s*([^<]+?)\s*</span>',
+            r'<span[^>]+id=["\']input-error["\'][^>]*>\s*([^<]+?)\s*</span>',
+            r'<div[^>]+class=["\'][^"\']*alert-error[^"\']*["\'][^>]*>(?:\s*<[^>]+>\s*)*\s*([^<]+?)\s*<',
+            r'<span[^>]+class=["\'][^"\']*pf-c-form__helper-text[^"\']*["\'][^>]*>\s*([^<]+?)\s*</span>',
+            # Even-broader fallback: look for anything mentioning
+            # "feedback" or "alert" and pull the inner text
+            r'<[^>]+class=["\'][^"\']*(?:feedback|alert-error|invalid-feedback)[^"\']*["\'][^>]*>(?:\s*<[^>]+>\s*)*\s*([^<]{4,200}?)\s*<',
+        ):
+            m = re.search(pattern, post_body, re.DOTALL | re.IGNORECASE)
+            if m and m.group(1).strip():
+                error_msg = m.group(1).strip()
+                break
+
+        # Also: did the title change? Keycloak sometimes signals
+        # "logged in" via a different page title.
+        title_m = re.search(r"<title>([^<]+)</title>", post_body, re.IGNORECASE)
+        post_title = title_m.group(1).strip() if title_m else ""
+
+        # Save GET and POST HTML to disk for manual inspection — the
+        # user can then send the diff/snippet back to us instead of
+        # us trying to truncate it usefully into the log.
+        try:
+            log_dir = os.path.dirname(log_path) or "."
+            with open(os.path.join(log_dir, "kia_probe7_get.html"), "w",
+                      encoding="utf-8") as f:
+                f.write(get_body)
+            with open(os.path.join(log_dir, "kia_probe7_post.html"), "w",
+                      encoding="utf-8") as f:
+                f.write(post_body)
+            _direct_log(
+                log_path,
+                f"  [Probe 7] saved GET + POST HTML to "
+                f"kia_probe7_get.html / kia_probe7_post.html for inspection",
+            )
+        except OSError:
+            pass
+
+        if error_msg:
+            _direct_log(
+                log_path,
+                f"  [Probe 7] Keycloak error: '{error_msg}' (login form re-rendered)",
+            )
+        else:
+            len_diff = len(post_body) - len(get_body)
+            _direct_log(
+                log_path,
+                f"  [Probe 7] login rejected — no extractable error message. "
+                f"GET body={len(get_body)} chars, POST body={len(post_body)} chars "
+                f"(diff={len_diff:+d}). POST title='{post_title}'.",
+            )
+        return None
+
+    location = resp.headers.get("Location", "")
+    match = re.search(r"[?&]code=([^&]+)", location)
+    if not match:
+        _direct_log(
+            log_path,
+            f"  [Probe 7] no code in redirect Location: {_safe_truncate(location, 200)}",
+        )
+        return None
+
+    auth_code = match.group(1)
+    _direct_log(log_path, "  [Probe 7] got auth code from backend Keycloak")
 
     # ----------------------------------------------------------------
-    # Probe 4: Same authorize endpoint, but we follow redirects this
-    # time. If CCSP routes us through a non-WAF login page somewhere,
-    # we'll see it in the chain. Also tries the device-registration
-    # endpoint to confirm the CCSP backend accepts our app headers
-    # (sanity check — this should always succeed if our Stamp is valid).
+    # Step 4: exchange code at backend token endpoint.
     # ----------------------------------------------------------------
-    _direct_log(log_path, "\n--- Probe 4: Device-register sanity check ---")
+    token_url = f"{realm_url}/protocol/openid-connect/token"
+    _direct_log(log_path, f"\n  [Probe 7 — Token exchange] POST {token_url}")
     try:
-        url = "https://prd.eu-ccapi.kia.com:8080/api/v1/spa/notifications/register"
-        import uuid
-        body = {
-            "pushRegId": "0" * 64,
-            "pushType": "APNS",
-            "uuid": str(uuid.uuid4()),
-        }
-        headers = {
-            "User-Agent": KIA_EU_OKHTTP_UA,
-            "Stamp": _kia_eu_stamp(),
-            "ccsp-service-id": KIA_EU_CCSP_SERVICE_ID,
-            "ccsp-application-id": KIA_EU_APP_ID,
-            "Content-Type": "application/json;charset=UTF-8",
-            "Host": "prd.eu-ccapi.kia.com:8080",
-            "Connection": "Keep-Alive",
-            "Accept-Encoding": "gzip",
-        }
-        resp = s.post(url, json=body, headers=headers, timeout=30)
-        _log_response(log_path, "Probe 4", resp)
-    except Exception as e:
-        _direct_log(log_path, f"  [Probe 4] exception: {e}")
+        resp = s.post(
+            token_url,
+            data={
+                "grant_type": "authorization_code",
+                "code": auth_code,
+                "redirect_uri": backend_redirect,
+                "client_id": backend_client_id,
+            },
+            timeout=15,
+        )
+    except Exception as exc:
+        _direct_log(log_path, f"  [Probe 7] token exchange network error: {exc}")
+        return None
+    _log_response(log_path, "Probe 7 token exchange", resp)
+
+    if resp.status_code != 200:
+        return None
+    try:
+        tokens = resp.json()
+    except ValueError:
+        return None
+    if tokens.get("refresh_token") and tokens.get("access_token"):
+        _direct_log(
+            log_path,
+            "  [Probe 7] backend authorization_code flow SUCCEEDED — "
+            "tokens issued by backend Keycloak (iss != 'uvo'). "
+            "May need translation for HA.",
+        )
+        return tokens
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Probe 8: opt-in real-browser diagnostic via --keycloak-browser. Drives
+# Chrome through the full login UI to confirm the auth chain is reachable
+# end-to-end. Not part of the automatic chain. See _probe_keycloak_browser
+# docstring for what this can and cannot produce.
+# ---------------------------------------------------------------------------
+def _pkce_pair():
+    """Generate an RFC 7636 PKCE (verifier, challenge) pair using S256."""
+    # 64 random bytes -> 86-char base64url (no padding) verifier.
+    # RFC 7636 spec: 43-128 chars, [A-Z a-z 0-9 - . _ ~].
+    verifier = (
+        base64.urlsafe_b64encode(secrets.token_bytes(64))
+        .rstrip(b"=")
+        .decode("ascii")
+    )
+    digest = hashlib.sha256(verifier.encode("ascii")).digest()
+    challenge = base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
+    return verifier, challenge
+
+
+def _probe_keycloak_browser(brand_config, email, password, log_path,
+                            headless=False, debug_log_extras=True):
+    """
+    Drive a real Chrome browser through the standard OIDC login UI as
+    a diagnostic. Captures the OAuth auth code from the redirect, but
+    does not produce usable tokens for the connect API surface (token
+    exchange is locked by a configuration we don't control). Useful as
+    a reachability check; for tokens, use the default chain.
+    """
+    _require_selenium()  # we use WebDriverWait/EC/By/WebDriverException
+    try:
+        import undetected_chromedriver as uc
+    except ImportError as exc:
+        raise RuntimeError(
+            "Probe 8 (--keycloak-browser) requires undetected-chromedriver. "
+            "Install it with: python -m pip install undetected-chromedriver"
+        ) from exc
+
+    realm_url = brand_config.get("backend_realm_url")
+    if not realm_url:
+        _direct_log(log_path, "  [Probe 8] backend_realm_url not configured, skipping.")
+        return None
+
+    # PKCE — belt-and-suspenders. Some Keycloak configs require it
+    # for confidential clients too.
+    code_verifier, code_challenge = _pkce_pair()
+
+    def _build_auth_url(cid, redir):
+        return (
+            f"{realm_url}/protocol/openid-connect/auth"
+            f"?client_id={cid}"
+            "&response_type=code"
+            f"&redirect_uri={redir}"
+            "&state=ccsp"
+            "&scope=openid"
+            f"&code_challenge={code_challenge}"
+            "&code_challenge_method=S256"
+        )
+
+    # Marketing client is the only one that works at the backend
+    # Keycloak realm — v3.9.4 confirmed via kia_probe8_initial_ccsp.html
+    # that the CCSP client_id (`fdc85c00-...`) returns Keycloak's
+    # "Client nicht gefunden" error page at this realm. The CCSP client
+    # only exists at idpconnect-eu.kia.com (the front-end IdP we're
+    # trying to bypass with Probe 8 in the first place).
+    #
+    # The marketing client is configured as a confidential client with
+    # an unknown secret, so the token exchange tries a guess list (see
+    # below). Even if no guess wins, the captured auth code + URL chain
+    # are valuable diagnostic data.
+    mkt_cfg = {
+        "label": "marketing",
+        "client_id": brand_config.get("marketing_client_id"),
+        "redirect": brand_config.get("marketing_redirect_uri"),
+        "secret": None,  # not known — token exchange uses guess list
+    }
+    candidates = [c for c in (mkt_cfg,)
+                  if c["client_id"] and c["redirect"]]
+    if not candidates:
+        _direct_log(log_path, "  [Probe 8] no usable client config (need either CCSP or marketing).")
+        return None
+
+    _direct_log(log_path, f"\n=== Probe 8: real-browser Keycloak login ===")
+    _direct_log(log_path, f"  realm: {realm_url}")
+    _direct_log(log_path, f"  authorize candidates: {[c['label'] for c in candidates]}")
+    _direct_log(log_path, f"  headless: {headless}")
+    _direct_log(log_path, f"  PKCE challenge sent (S256, verifier kept for token exchange)")
+
+    options = uc.ChromeOptions()
+    options.add_argument("--start-maximized")
+    options.add_argument("--no-sandbox")
+    options.add_argument("--disable-dev-shm-usage")
+    # Real-looking UA — uc sets one by default but we override to a
+    # current desktop Chrome to match what reCAPTCHA expects.
+    options.add_argument(
+        "--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/130.0.0.0 Safari/537.36"
+    )
+    # Enable Chrome's performance log so we can drain it during the
+    # post-login wait — catches transient URLs (the OAuth redirect with
+    # code= flashes by quickly because Kia's /api/bin/oneid/login is a
+    # registered redirect_uri but its 404 handler immediately routes
+    # away to /api/bin/oneid/q for analytics tracking).
+    try:
+        options.set_capability(
+            "goog:loggingPrefs",
+            {"performance": "ALL", "browser": "ALL"},
+        )
+    except Exception:
+        # uc.ChromeOptions may not support set_capability on every
+        # build — non-fatal, the fallback is plain URL polling.
+        pass
+
+    driver = None
+    try:
+        print("[Probe 8] Starting undetected Chrome -- first run downloads "
+              "ChromeDriver, this can take 10-30 seconds...")
+        driver = uc.Chrome(
+            options=options,
+            version_main=_chrome_major_version(),
+            use_subprocess=True,
+            headless=headless,
+        )
+        driver.set_page_load_timeout(60)
+
+        # Step 1: navigate to backend Keycloak login. Try each
+        # client-config candidate; keep the first one whose authorize
+        # response actually renders the login form.
+        active_cfg = None
+        for cfg in candidates:
+            cur_auth_url = _build_auth_url(cfg["client_id"], cfg["redirect"])
+            _direct_log(log_path, f"\n  [Probe 8] [{cfg['label']}] Loading auth URL...")
+            _direct_log(log_path, f"    {_safe_truncate(cur_auth_url, 220)}")
+            try:
+                driver.get(cur_auth_url)
+            except WebDriverException as exc:
+                _direct_log(log_path, f"  [Probe 8] [{cfg['label']}] navigation error: {exc}")
+                continue
+
+            # Dump initial page source for forensics regardless of outcome.
+            try:
+                log_dir = os.path.dirname(log_path) or "."
+                with open(os.path.join(log_dir, f"kia_probe8_initial_{cfg['label']}.html"),
+                          "w", encoding="utf-8") as f:
+                    f.write(driver.page_source or "")
+            except (OSError, WebDriverException):
+                pass
+
+            # 5s wait: form ready, or this candidate is rejected.
+            # Watch for #BtnLogin (the "Anmelden" button) — it's always
+            # present on the working multi-step login page regardless of
+            # which step is active, and it's NOT present on Keycloak's
+            # error page (which has no form action at all). Watching for
+            # #FormEmail directly fails on the new 3-step UI because the
+            # email field is `display: none` until step 1->2 is reached.
+            try:
+                WebDriverWait(driver, 5).until(
+                    EC.element_to_be_clickable((By.ID, "BtnLogin"))
+                )
+                active_cfg = cfg
+                _direct_log(log_path, f"  [Probe 8] [{cfg['label']}] login form ready (BtnLogin clickable).")
+                break
+            except TimeoutException:
+                # Diagnose Keycloak's response.
+                try:
+                    cur_url = driver.current_url
+                    src_head = (driver.page_source or "")[:5000]
+                except WebDriverException:
+                    cur_url, src_head = "", ""
+                _direct_log(log_path, f"  [Probe 8] [{cfg['label']}] form not visible after 5s.")
+                _direct_log(log_path, f"    URL: {_safe_truncate(cur_url, 220)}")
+                # Keycloak shows error pages with kc-feedback-text spans
+                m = re.search(
+                    r'<span[^>]*class="kc-feedback-text"[^>]*>([^<]+)</span>',
+                    src_head, re.IGNORECASE,
+                )
+                if m:
+                    _direct_log(log_path, f"    Keycloak feedback: {m.group(1).strip()}")
+                # Common Keycloak error markers
+                for marker in ("invalid_redirect_uri", "Client not found",
+                               "We are sorry", "/error?", "Unauthorized",
+                               "Access denied", "We're sorry"):
+                    if marker.lower() in (cur_url + " " + src_head).lower():
+                        _direct_log(log_path, f"    error marker '{marker}' detected.")
+                        break
+
+        if not active_cfg:
+            _direct_log(
+                log_path,
+                "  [Probe 8] no client config produced a login form. "
+                "Inspect kia_probe8_initial_*.html files to see Keycloak's responses.",
+            )
+            return None
+
+        # Use whichever config rendered the form for the rest of the flow.
+        chosen_label = active_cfg["label"]
+        backend_client_id = active_cfg["client_id"]
+        backend_redirect = active_cfg["redirect"]
+        backend_secret = active_cfg["secret"]
+
+        # Step 2: drive Kia's multi-step login form via a state machine.
+        #
+        # As of late April 2026, Kia uses a 3-step UI:
+        #   step 1: only "Anmelden"/"Registrieren" buttons visible
+        #           (#FormEmail and #FormPassword both display:none)
+        #   step 2: #FormEmail visible (#FormPassword still hidden),
+        #           BtnLogin text becomes "Weiter"
+        #   step 3: #FormPassword visible, BtnLogin text becomes
+        #           "Anmelden", clicking it triggers reCAPTCHA + submit
+        #
+        # Earlier versions of the UI sometimes skip step 1 (the form
+        # opens directly with email field visible). Rather than
+        # hardcoding any one variant, we loop and detect which step is
+        # active by checking #FormPassword > #FormEmail > else
+        # ("initial step, click Anmelden to advance").
+
+        def _is_visible(loc):
+            els = driver.find_elements(*loc)
+            if not els:
+                return False
+            try:
+                return els[0].is_displayed()
+            except WebDriverException:
+                return False
+
+        _direct_log(log_path, f"  [Probe 8] [{chosen_label}] Driving multi-step form...")
+        login_submitted = False
+        for step in range(5):
+            time.sleep(1.0)  # let JS animations/transitions settle
+            if _is_visible((By.ID, "FormPassword")):
+                _direct_log(log_path, f"  [Probe 8] step {step}: password field visible -> fill + submit")
+                pwd_field = driver.find_element(By.ID, "FormPassword")
+                pwd_field.clear()
+                pwd_field.send_keys(password)
+                time.sleep(0.5)
+                btn = driver.find_element(By.ID, "BtnLogin")
+                driver.execute_script("arguments[0].click();", btn)
+                login_submitted = True
+                break
+            elif _is_visible((By.ID, "FormEmail")):
+                _direct_log(log_path, f"  [Probe 8] step {step}: email field visible -> fill + Weiter")
+                em_field = driver.find_element(By.ID, "FormEmail")
+                em_field.clear()
+                em_field.send_keys(email)
+                time.sleep(0.5)
+                btn = driver.find_element(By.ID, "BtnLogin")
+                driver.execute_script("arguments[0].click();", btn)
+            else:
+                _direct_log(log_path, f"  [Probe 8] step {step}: initial screen -> click Anmelden")
+                try:
+                    btn = driver.find_element(By.ID, "BtnLogin")
+                    driver.execute_script("arguments[0].click();", btn)
+                except WebDriverException as exc:
+                    _direct_log(log_path, f"  [Probe 8] step {step}: BtnLogin not found: {exc}")
+                    return None
+        if not login_submitted:
+            _direct_log(
+                log_path,
+                "  [Probe 8] could not reach the password step within 5 form-step iterations. "
+                "Either the UI structure changed or focus was stolen by a cookie banner.",
+            )
+            return None
+        _direct_log(log_path, "  [Probe 8] form submitted (reCAPTCHA fires asynchronously)")
+
+        # Step 4: tight-poll for the redirect with code= in URL.
+        #
+        # The OAuth redirect after Keycloak login goes to the CCSP
+        # redirect_uri:
+        #   https://prd.eu-ccapi.kia.com:8080/api/v1/user/oauth2/redirect?code=...
+        # That host:port is internal (Kia's CCSP backend listens here),
+        # so the browser will fail to connect from the public internet
+        # — but Keycloak issues a 302 to that URL FIRST, and Chrome
+        # fires a Network.requestWillBeSent CDP event with the full
+        # `?code=...` URL BEFORE the connection is even attempted. So
+        # we still capture the code from the URL chain even though the
+        # navigation itself dies with NET_ERR_CONNECTION_REFUSED.
+        #
+        # The URL flashes by quickly. v3.9.0 used WebDriverWait with
+        # default 500ms poll which missed it. v3.9.1 tight-polls at
+        # 100ms AND tracks the full URL chain — even if the URL with
+        # code= only exists for one poll cycle, it lands in the chain
+        # and we extract the code from there.
+        #
+        # We also drain the CDP performance log every iteration, which
+        # captures every navigation event including ones that happened
+        # too fast for plain URL polling.
+        _direct_log(log_path, "  [Probe 8] Tight-polling for redirect with code= (up to 60s)...")
+        # Cache the initial URL — never call driver.current_url twice in
+        # a row, the browser may navigate between reads (especially right
+        # after we just clicked Log In and reCAPTCHA fired).
+        initial_url = driver.current_url
+        url_chain = [initial_url]
+        _direct_log(log_path, f"    URL: {_safe_truncate(initial_url, 200)}")
+        deadline = time.time() + 60
+        auth_code = None
+        recaptcha_blocked = False
+
+        def _scan_for_code(url):
+            m = re.search(r"[?&]code=([^&]+)", url or "")
+            return m.group(1) if m else None
+
+        while time.time() < deadline:
+            try:
+                cur = driver.current_url
+            except WebDriverException as exc:
+                _direct_log(log_path, f"    URL read failed: {exc}")
+                break
+            if cur != url_chain[-1]:
+                url_chain.append(cur)
+                _direct_log(log_path, f"    URL: {_safe_truncate(cur, 200)}")
+
+            # Search every URL we've observed (current + history) for code=
+            for url in url_chain:
+                code = _scan_for_code(url)
+                if code:
+                    auth_code = code
+                    _direct_log(
+                        log_path,
+                        f"  [Probe 8] auth code captured from URL: "
+                        f"{_safe_truncate(url, 200)}",
+                    )
+                    break
+            if auth_code:
+                break
+
+            # Drain CDP performance log to catch URLs we polled too slow for.
+            # uc may or may not have set goog:loggingPrefs — try-except either way.
+            try:
+                perf_logs = driver.get_log("performance")
+                for entry in perf_logs:
+                    try:
+                        msg = json.loads(entry["message"])["message"]
+                    except (KeyError, ValueError):
+                        continue
+                    if msg.get("method") not in (
+                        "Network.requestWillBeSent",
+                        "Network.responseReceived",
+                        "Page.frameNavigated",
+                    ):
+                        continue
+                    params = msg.get("params", {}) or {}
+                    candidate_urls = []
+                    if "request" in params:
+                        candidate_urls.append(params["request"].get("url", ""))
+                    if "response" in params:
+                        candidate_urls.append(params["response"].get("url", ""))
+                    if "frame" in params:
+                        candidate_urls.append(params["frame"].get("url", ""))
+                    candidate_urls.append(params.get("documentURL", ""))
+                    for u in candidate_urls:
+                        if u and u not in url_chain:
+                            url_chain.append(u)
+                            _direct_log(log_path, f"    CDP URL: {_safe_truncate(u, 200)}")
+                        code = _scan_for_code(u)
+                        if code:
+                            auth_code = code
+                            _direct_log(
+                                log_path,
+                                f"  [Probe 8] auth code captured via CDP: "
+                                f"{_safe_truncate(u, 200)}",
+                            )
+                            break
+                    if auth_code:
+                        break
+            except (WebDriverException, Exception):
+                pass
+            if auth_code:
+                break
+
+            # Bail if we hit a Keycloak error or reCAPTCHA failure
+            if "/error" in cur or "recaptcha_failed" in cur:
+                # Quickly check page source for error marker — limit read size
+                try:
+                    src_head = (driver.page_source or "")[:5000]
+                except WebDriverException:
+                    src_head = ""
+                if "recaptcha_failed" in src_head or "/error" in cur:
+                    recaptcha_blocked = True
+                    break
+
+            time.sleep(0.1)
+
+        # Always save GET + post-login HTML for diagnostics
+        try:
+            log_dir = os.path.dirname(log_path) or "."
+            with open(os.path.join(log_dir, "kia_probe8_final.html"),
+                      "w", encoding="utf-8") as f:
+                f.write(driver.page_source or "")
+        except (OSError, WebDriverException):
+            pass
+
+        # Log the full URL chain we observed
+        _direct_log(log_path, f"  [Probe 8] full URL chain ({len(url_chain)} entries):")
+        for u in url_chain:
+            _direct_log(log_path, f"    -> {_safe_truncate(u, 220)}")
+
+        if debug_log_extras:
+            try:
+                cookies = driver.get_cookies()
+                _direct_log(log_path, f"  [Probe 8] {len(cookies)} cookies on session")
+            except Exception:
+                pass
+
+        if recaptcha_blocked:
+            _direct_log(
+                log_path,
+                "  [Probe 8] login rejected (reCAPTCHA score below threshold). "
+                "Try without --keycloak-browser-headless, or run a few times "
+                "to build browser-profile trust with Google.",
+            )
+            return None
+
+        if not auth_code:
+            _direct_log(
+                log_path,
+                "  [Probe 8] no auth code observed in any URL. "
+                "Possible reasons: login form structure changed, reCAPTCHA "
+                "took longer than 60s, or Kia's redirect URI handler "
+                "no longer carries the code.",
+            )
+            return None
+
+        _direct_log(log_path, "  [Probe 8] got auth code from real-browser Keycloak login")
+
+    except WebDriverException as exc:
+        _direct_log(log_path, f"  [Probe 8] WebDriver error: {exc}")
+        return None
+    except Exception as exc:
+        _direct_log(log_path, f"  [Probe 8] unexpected error: {exc}")
+        return None
+    finally:
+        if driver:
+            try:
+                driver.quit()
+            except Exception:
+                pass
+
+    # Step 5: exchange the auth code at the BACKEND token endpoint
+    # (not the public IdP's). Plain `requests` is fine — the backend
+    # token endpoint isn't gated.
+    token_url = f"{realm_url}/protocol/openid-connect/token"
+    base_data = {
+        "grant_type": "authorization_code",
+        "code": auth_code,
+        "redirect_uri": backend_redirect,
+        "client_id": backend_client_id,
+        "code_verifier": code_verifier,
+    }
+    # Build the variant list dynamically based on which client we used.
+    # CCSP path: known secret first.
+    # Marketing path: secret unknown, try public-client form + plausible
+    # guesses (literal "secret", client_id-as-secret, empty string).
+    if backend_secret:
+        attempts = [
+            (f"{chosen_label} secret + PKCE",
+             {**base_data, "client_secret": backend_secret}),
+            (f"{chosen_label} secret without PKCE",
+             {k: v for k, v in {**base_data, "client_secret": backend_secret}.items()
+              if k != "code_verifier"}),
+            ("PKCE only (public-client form)", base_data),
+        ]
+    else:
+        # Marketing client: confidential, secret is server-side at kia.com.
+        # We cannot guess it. The wider list below is a cheap "no harm in
+        # trying" sweep — none of these are likely to match, but if any
+        # ever does, we want to know fast.
+        guesses = [
+            "secret",
+            backend_client_id,           # peukiaidm-online-sales
+            "",                          # public-client coercion
+            "kia",
+            "eukia",
+            "eukiaidm",                  # realm name
+            "online-sales",
+            "peukiaidm",
+            "kiaconnect",
+            "kia-connect",
+            "admin",                     # default Keycloak admin
+        ]
+        attempts = [("PKCE only (public-client form)", base_data)]
+        for g in guesses:
+            attempts.append((
+                f"PKCE + client_secret={g!r}",
+                {**base_data, "client_secret": g},
+            ))
+            attempts.append((
+                f"client_secret={g!r} (no PKCE)",
+                {k: v for k, v in {**base_data, "client_secret": g}.items()
+                 if k != "code_verifier"},
+            ))
+    tokens = None
+    for label, data in attempts:
+        _direct_log(log_path, f"\n  [Probe 8 — Token exchange] {label} -> POST {token_url}")
+        try:
+            resp = requests.post(token_url, data=data, timeout=30)
+        except requests.RequestException as exc:
+            _direct_log(log_path, f"  [Probe 8 token exchange] network error: {exc}")
+            return None
+        _log_response(log_path, f"Probe 8 token exchange ({label})", resp)
+        if resp.status_code == 200:
+            try:
+                parsed = resp.json()
+            except ValueError:
+                parsed = None
+            if parsed and parsed.get("refresh_token") and parsed.get("access_token"):
+                tokens = parsed
+                _direct_log(
+                    log_path,
+                    f"  [Probe 8] token exchange variant '{label}' SUCCEEDED.",
+                )
+                break
+        # 4xx -> try next variant
+    if not tokens:
+        conclusion = [
+            "",
+            "[Probe 8] login chain reachable; auth code was captured.",
+            "[Probe 8] Token exchange did not complete via this path.",
+            "[Probe 8] For tokens, run the script without --keycloak-browser.",
+        ]
+        for line in conclusion:
+            _direct_log(log_path, line)
+            print(line)
+        return None
+    _direct_log(
+        log_path,
+        "  [Probe 8] real-browser Keycloak login SUCCEEDED — "
+        "Keycloak-native tokens (iss = backend realm).",
+    )
+    return tokens
+
+
+# ---------------------------------------------------------------------------
+# Probe 0: plain stdlib requests, standard signin form. Tried first
+# because it's the simplest path with the fewest dependencies.
+# ---------------------------------------------------------------------------
+def _probe_plain_signin(brand_config, email, password, log_path):
+    """
+    Probe 0: plain stdlib requests, plaintext signin at
+    /auth/account/signin with the CCSP client_id. Returns a token
+    dict (already validated) on success, None on failure.
+    """
+    s = requests.Session()
+    s.headers.update({
+        "Accept-Encoding": "gzip",
+        "User-Agent": random.choice(BROWSER_UA_POOL),
+    })
+
+    code = _form_signin_legacy(s, brand_config, email, password, log_path)
+    if not code:
+        return None
+    _direct_log(log_path, "  [Probe 0] got code, exchanging for tokens…")
+    tokens = _exchange_code_for_tokens(s, code, brand_config, log_path)
+    if not (tokens and tokens.get("refresh_token") and tokens.get("access_token")):
+        return None
+    if _validate_refresh_token(tokens["refresh_token"], brand_config, log_path):
+        _direct_log(log_path, "  [JACKPOT] Probe 0 tokens validated.")
+    else:
+        _direct_log(
+            log_path,
+            "  [WARN] Probe 0 got tokens but validation failed — "
+            "returning anyway (may still work in Home Assistant).",
+        )
+    return tokens
+
+
+def _create_curl_cffi_session(log_path):
+    """
+    Create a curl_cffi Session with TLS impersonation, trying the
+    preferred profiles in random order and falling back to no-
+    impersonation if none work on this build. Returns (session,
+    profile_name).
+
+    Some curl_cffi builds (notably the Windows wheel of 0.15.0)
+    only ship a subset of impersonation profiles. To detect which
+    profiles work without spending a real network round-trip, we
+    use the fact that `Session(impersonate=...)` itself accepts
+    any name but the underlying request raises only on first use.
+    So we issue a tiny throwaway HEAD against a known-up host
+    (kia.com, which is unrelated to the IdP and won't itself flag
+    anything) before returning.
+    """
+    from curl_cffi import requests as curl_requests
+
+    profiles = list(TLS_IMPERSONATE_POOL)
+    random.shuffle(profiles)
+    profiles.append(None)  # last-resort: no impersonation
+
+    for profile in profiles:
+        try:
+            if profile is None:
+                s = curl_requests.Session()
+            else:
+                s = curl_requests.Session(impersonate=profile)
+            # Validate the profile actually works on this build.
+            s.head("https://www.kia.com/", timeout=10, allow_redirects=False)
+            label = profile or "(none)"
+            _direct_log(log_path, f"TLS profile (active): {label}")
+            return s, label
+        except Exception as exc:
+            err = str(exc)
+            if "Impersonating" in err and "not supported" in err:
+                _direct_log(log_path, f"  TLS profile {profile} not supported on this build, trying next")
+                continue
+            # Any other error (DNS, transient network) — the profile
+            # is fine, the network blip is unrelated. Use this session.
+            label = profile or "(none)"
+            _direct_log(
+                log_path,
+                f"TLS profile (active): {label}  "
+                f"(probe HEAD got {err[:80]} — that's fine, profile works)",
+            )
+            return s, label
+
+    raise RuntimeError(
+        "Could not create any curl_cffi session — every impersonation "
+        "profile rejected by this curl_cffi build."
+    )
+
+
+def _validate_refresh_token(refresh_token, brand_config, log_path):
+    """
+    Confirm the freshly-minted refresh_token actually mints a new
+    access_token. Catches the case where signin returned a code that
+    exchanged successfully but the resulting token isn't usable.
+    Plain `requests` is fine here — token endpoints aren't gated and don't need TLS impersonation.
+    """
+    url = brand_config["token_url"]
+    data = {
+        "grant_type": "refresh_token",
+        "refresh_token": refresh_token,
+        "client_id": brand_config["client_id"],
+        "client_secret": brand_config["client_secret"],
+    }
+    _direct_log(log_path, f"\n  [Token validation] POST {url}")
+    try:
+        resp = requests.post(url, data=data, timeout=30)
+    except requests.RequestException as exc:
+        _direct_log(log_path, f"  [Token validation] network error: {exc}")
+        return False
+    _log_response(log_path, "Token validation", resp)
+    if resp.status_code != 200:
+        return False
+    try:
+        body = resp.json()
+        return bool(body.get("access_token"))
+    except ValueError:
+        return False
+
+
+def _finalize_tokens(tokens, name, brand_config, log_path):
+    """Validate tokens; return them on success, None otherwise."""
+    if not (tokens and tokens.get("refresh_token") and tokens.get("access_token")):
+        return None
+    if _validate_refresh_token(tokens["refresh_token"], brand_config, log_path):
+        _direct_log(log_path, f"  [JACKPOT] {name} tokens validated.")
+        return tokens
+    _direct_log(
+        log_path,
+        f"  [WARN] {name} got tokens but validation failed — "
+        "returning anyway (may still work in Home Assistant).",
+    )
+    return tokens
+
+
+def _finalize_code_to_tokens(s, code, name, brand_config, log_path):
+    """Code → token exchange → validation. Returns tokens or None."""
+    if not code:
+        return None
+    _direct_log(log_path, f"  [{name}] got code, exchanging for tokens…")
+    tokens = _exchange_code_for_tokens(s, code, brand_config, log_path)
+    return _finalize_tokens(tokens, name, brand_config, log_path)
+
+
+# ---------------------------------------------------------------------------
+# Per-probe runners. Each returns tokens-or-None and is independently
+# callable. Used both by the chained eu_direct_probe (early-return on
+# first success) and the debug-all mode (run them all in isolation).
+# ---------------------------------------------------------------------------
+PROBE_RUNNERS = [
+    (
+        0,
+        "Plain stdlib signin (v3.0 method)",
+        "no_curl",
+        lambda _s, bc, em, pw, lp: _probe_plain_signin(bc, em, pw, lp),
+    ),
+    (
+        1,
+        "App-flow (curl_cffi + RSA-encrypted password)",
+        "curl",
+        lambda s, bc, em, pw, lp: _finalize_code_to_tokens(
+            s, _form_signin_app_flow(s, bc, em, pw, lp), "Probe 1 / App-flow", bc, lp
+        ),
+    ),
+    (
+        2,
+        "Legacy (curl_cffi + plaintext signin)",
+        "curl",
+        lambda s, bc, em, pw, lp: _finalize_code_to_tokens(
+            s, _form_signin_legacy(s, bc, em, pw, lp), "Probe 2 / Legacy", bc, lp
+        ),
+    ),
+    (
+        3,
+        "Marketing → CCSP via cookie reuse",
+        "curl",
+        lambda s, bc, em, pw, lp: _finalize_code_to_tokens(
+            s,
+            _probe_marketing_to_ccsp(s, bc, em, pw, lp),
+            "Probe 3 / Marketing→CCSP",
+            bc,
+            lp,
+        ),
+    ),
+    (
+        4,
+        "OIDC discovery + ROPC",
+        "curl",
+        lambda s, bc, em, pw, lp: _finalize_tokens(
+            _probe_oidc_discovery(s, bc, em, pw, lp),
+            "Probe 4 / OIDC discovery",
+            bc,
+            lp,
+        ),
+    ),
+    (
+        5,
+        "Backend Keycloak realm (eu-account.*) direct ROPC sweep",
+        "curl",
+        lambda s, bc, em, pw, lp: _finalize_tokens(
+            _probe_backend_realm(s, bc, em, pw, lp),
+            "Probe 5 / Backend realm",
+            bc,
+            lp,
+        ),
+    ),
+    (
+        6,
+        "Device flow at backend realm (discovery only — interactive via --device-flow)",
+        "curl",
+        # Probe 6 in the chain is DISCOVERY ONLY. Device flow needs the
+        # user to open a verification URL in a browser and log in there
+        # — that's interactive, can't run blocking inside the chain. So
+        # this lambda just sweeps candidate client_ids at the backend's
+        # device_authorization_endpoint, logs what's reachable, and
+        # always returns None. To actually use device flow, run the
+        # script with --device-flow.
+        lambda s, bc, em, pw, lp: (_probe_device_flow_discover(s, bc, lp), None)[1],
+    ),
+    (
+        7,
+        "Backend Keycloak realm authorization_code flow (form-based)",
+        "curl",
+        lambda s, bc, em, pw, lp: _finalize_tokens(
+            _probe_backend_auth_code(s, bc, em, pw, lp),
+            "Probe 7 / Backend auth_code",
+            bc,
+            lp,
+        ),
+    ),
+]
+
+
+def _make_curl_cffi_session_with_ua(log_path):
+    """Create a curl_cffi session and set headers. Returns session or None on setup failure."""
+    try:
+        s, _ = _create_curl_cffi_session(log_path)
+    except RuntimeError as exc:
+        _direct_log(log_path, f"  [curl_cffi setup] {exc}")
+        return None
+    s.headers.update({
+        "Accept-Encoding": "gzip",
+        "User-Agent": random.choice(BROWSER_UA_POOL),
+    })
+    return s
+
+
+def eu_direct_probe(email, password, brand_config, log_path, debug_all=False):
+    """
+    Browserless login for Kia or Hyundai EU.
+
+    Normal mode (debug_all=False): runs probes 0-5 in order, returns
+    the first success. The fallback chain is intact — same behavior
+    as v3.2.x.
+
+    Debug mode (debug_all=True): runs every probe regardless of
+    success, each in its own isolated curl_cffi session (probe 0 is
+    plain requests as always). Returns the first probe's tokens for
+    the user, but logs and prints which probes succeeded vs failed
+    so the user can verify the fallback chain is intact.
+
+    See PROBE_RUNNERS for the list of probes.
+    """
+    try:
+        from curl_cffi import requests as curl_requests  # noqa: F401
+    except ImportError as exc:
+        raise RuntimeError(
+            "EU direct mode requires curl_cffi for TLS impersonation. "
+            "Install it with: python -m pip install curl_cffi"
+        ) from exc
+
+    _direct_log(
+        log_path,
+        f"\n=== {brand_config['name']} Direct API Probe — "
+        f"{dt.datetime.now():%Y-%m-%d %H:%M:%S} ===",
+    )
+    _direct_log(log_path, f"Email: {email}")
+    if debug_all:
+        _direct_log(
+            log_path,
+            "*** DEBUG-ALL mode: running every probe in isolation ***",
+        )
+
+    results = {}  # probe_idx -> tokens or None
+
+    # In normal mode, probes 1-5 share a single curl_cffi session so
+    # cookies persist (Probe 3 specifically benefits from that).
+    # In debug mode, each probe gets a fresh session for fair
+    # isolation — otherwise Probe 1 leftover cookies could pollute
+    # Probe 3's cookie-reuse experiment.
+    shared_curl_session = None
+
+    for idx, name, kind, runner in PROBE_RUNNERS:
+        _direct_log(log_path, f"\n--- Probe {idx}: {name} ---")
+        if kind == "no_curl":
+            session = None  # probe 0 doesn't use curl_cffi
+        else:
+            if debug_all:
+                session = _make_curl_cffi_session_with_ua(log_path)
+            else:
+                if shared_curl_session is None:
+                    shared_curl_session = _make_curl_cffi_session_with_ua(log_path)
+                session = shared_curl_session
+            if session is None:
+                _direct_log(log_path, f"  [Probe {idx}] curl_cffi unavailable, skipping.")
+                results[idx] = None
+                continue
+        try:
+            tokens = runner(session, brand_config, email, password, log_path)
+        except Exception as exc:
+            _direct_log(log_path, f"  [Probe {idx}] unexpected error: {exc}")
+            tokens = None
+        results[idx] = tokens
+
+        if tokens and not debug_all:
+            return tokens
+
+    # Debug mode: print summary
+    if debug_all:
+        _direct_log(log_path, "\n=== DEBUG-ALL SUMMARY ===")
+        for idx, name, _kind, _runner in PROBE_RUNNERS:
+            status = "PASS" if results.get(idx) else "FAIL"
+            _direct_log(log_path, f"  Probe {idx}: [{status}]  {name}")
+
+        print()
+        print("=" * 60)
+        print("DEBUG-ALL probe results")
+        print("=" * 60)
+        for idx, name, _kind, _runner in PROBE_RUNNERS:
+            status = "[PASS]" if results.get(idx) else "[FAIL]"
+            print(f"  Probe {idx}: {status}  {name}")
+        print("=" * 60)
+        print()
+
+        # Return the first successful probe's tokens for the user.
+        for idx, _name, _kind, _runner in PROBE_RUNNERS:
+            if results.get(idx):
+                return results[idx]
+        return None
 
     _direct_log(log_path, "\n=== All probes exhausted, no token obtained ===\n")
     return None
 
 
-def _run_kia_eu_direct(region, brand):
-    """Browserless direct-API path for Kia EU. Prompts for credentials."""
+# Backwards-compatible alias for callers that import the old name.
+def kia_eu_direct_probe(email, password, log_path):
+    """Deprecated alias for eu_direct_probe(..., KIA_EU_BRAND_CONFIG, ...)."""
+    return eu_direct_probe(email, password, KIA_EU_BRAND_CONFIG, log_path)
+
+
+def _run_eu_direct(region, brand, brand_config, debug_all=False):
+    """
+    Browserless direct-API path for Kia/Hyundai EU. Prompts for
+    credentials. If both direct-API paths fail, automatically falls
+    back to the marketing-client browser flow as last resort, so the
+    user always gets at least one chance to recover.
+
+    debug_all=True runs all probes regardless of success and prints
+    a summary table — useful for verifying that fallback paths are
+    actually still working (and not silently broken until the
+    primary fails).
+    """
     debug_log_path = os.path.abspath(DEBUG_LOG_FILE)
     try:
         with open(debug_log_path, "w", encoding="utf-8") as f:
             f.write(
-                f"Kia EU direct-API debug log — "
+                f"{brand_config['name']} direct-API debug log -- "
                 f"{dt.datetime.now():%Y-%m-%d %H:%M:%S}\n"
             )
     except OSError:
         pass
 
-    print(f"Logging into {brand['name']} ({region['name']}) — no browser needed.\n")
-    print("Your credentials are sent only to Kia's own endpoints")
-    print("(idpconnect-eu.kia.com, prd.eu-ccapi.kia.com), never to a third")
-    print("party, never written to disk in plaintext. The password prompt")
-    print("below is hidden as you type.\n")
+    host_short = brand_config["host"].replace("https://", "")
+    redirect_short = brand_config["redirect_uri"].replace("https://", "").split("/")[0]
+
+    print(f"Logging into {brand['name']} ({region['name']}) -- no browser needed.\n")
+    if debug_all:
+        print("*** DEBUG-ALL mode: every probe will run, even after one succeeds.")
+        print("    Takes ~30-60s. A summary table prints at the end.")
+        print()
+    print(f"Your credentials are sent only to {brand['name']}'s own endpoints")
+    print(f"({host_short}, {redirect_short}), never to a third party,")
+    print("never written to disk in plaintext. The password prompt below")
+    print("is hidden as you type.\n")
     email = input("Email:    ").strip()
     password = getpass.getpass("Password: ")
     if not email or not password:
         print("[ERROR] Email or password is empty. Aborting.")
         return
 
-    print("\nFetching token (typically 5–15 seconds)...\n")
-    tokens = kia_eu_direct_probe(email, password, debug_log_path)
+    if debug_all:
+        print(f"\nRunning all {len(PROBE_RUNNERS)} probes -- this takes a while...\n")
+    else:
+        print("\nFetching token (typically 5-15 seconds)...\n")
+    try:
+        tokens = eu_direct_probe(
+            email, password, brand_config, debug_log_path, debug_all=debug_all
+        )
+    except RuntimeError as exc:
+        # Friendly message for missing curl_cffi / pycryptodome.
+        print(f"[ERROR] {exc}")
+        print("Re-run the Quick Start to install all dependencies, then retry.")
+        return
+
     if tokens and tokens.get("refresh_token") and tokens.get("access_token"):
         print(
             f"[OK] Your tokens are:\n\n"
             f"- Refresh Token: {tokens['refresh_token']}\n"
-            f"- Access Token:  {tokens['access_token']}"
+            f"- Access Token:  {tokens['access_token']}\n"
         )
-    else:
-        print("[ERROR] Could not obtain tokens. Possible reasons:")
-        print("  - Wrong email or password (most likely)")
-        print("  - Kia changed an endpoint (rare — please open an issue)")
-        print(f"\nThe full diagnostic log is at:\n  {debug_log_path}")
-        print("Open an issue with the log contents (passwords are NOT logged).")
+        print("Treat the refresh token like a password. Anyone holding it can")
+        print("control your vehicle. Store it in a password manager or your")
+        print("Home Assistant secrets file -- never in plain text.")
+        return
+
+    # ----------------------------------------------------------------
+    # Direct path failed. Walk the user through the browser fallback.
+    # The browser flow uses the marketing-client login (proven UX for
+    # solving any captcha) and then attempts the CCSP authorize
+    # handoff. The handoff is currently rejected for many EU
+    # users, but if the user's IP/account isn't on the block list (or
+    # if Kia has loosened the rule), this is their automatic recovery.
+    # ----------------------------------------------------------------
+    print("[ERROR] Could not obtain tokens via the direct API. Reasons in")
+    print("order of likelihood:")
+    print("  - Wrong email or password (most common -- re-check)")
+    print(f"  - {brand['name']} changed an endpoint (rare)")
+    print(f"\nDiagnostic log: {debug_log_path}")
+    print("(Passwords are not logged.)\n")
+
+    print("=" * 60)
+    print("FALLBACK: trying the browser-based flow as a last resort.")
+    print("This will open Chrome and let you log in there. Useful if")
+    print("the typo theory is wrong and an endpoint changed. Press")
+    print("Ctrl+C now to skip the browser fallback.")
+    print("=" * 60)
+    try:
+        for remaining in (5, 4, 3, 2, 1):
+            print(f"  Opening Chrome in {remaining}s...", end="\r", flush=True)
+            time.sleep(1)
+        print(" " * 40, end="\r")  # clear the countdown line
+    except KeyboardInterrupt:
+        print("\n\nFallback skipped. Run the script again to retry.")
+        return
+
+    _run_browser_flow(region, brand)
 
 
 def _run_browser_flow(region, brand):
@@ -903,17 +2816,262 @@ def _run_browser_flow(region, brand):
                 pass
 
 
+def _run_device_flow(region, brand, brand_config):
+    """
+    Interactive device-flow login at the backend Keycloak realm.
+    Triggered explicitly via --device-flow; doesn't go through the
+    automatic probe chain. The user opens a verification URI on
+    any browser, logs in there, this script polls for tokens.
+    No password is sent from this script in this mode (the user
+    enters it on Kia's official Keycloak page).
+    """
+    debug_log_path = os.path.abspath(DEBUG_LOG_FILE)
+    try:
+        with open(debug_log_path, "w", encoding="utf-8") as f:
+            f.write(
+                f"{brand_config['name']} device-flow log -- "
+                f"{dt.datetime.now():%Y-%m-%d %H:%M:%S}\n"
+            )
+    except OSError:
+        pass
+
+    print(f"Device flow login for {brand['name']} ({region['name']}).")
+    print("This is an experimental path. You will log in on a verification")
+    print("URL in any browser (your phone is fine), and this script will")
+    print("pick up the tokens once you're done -- no password is sent from")
+    print("this script.\n")
+
+    try:
+        from curl_cffi import requests as curl_requests  # noqa: F401
+    except ImportError as exc:
+        print(f"[ERROR] {exc}")
+        print("Re-run pip install -r requirements.txt and try again.")
+        return
+
+    s = _make_curl_cffi_session_with_ua(debug_log_path)
+    if s is None:
+        print("[ERROR] curl_cffi session could not be set up. See debug log.")
+        return
+
+    findings = _probe_device_flow_discover(s, brand_config, debug_log_path)
+    if not findings:
+        print("[ERROR] No client_id at the backend realm accepted device-flow")
+        print("initialization. The chain has no usable device-flow path right")
+        print("now. See debug log for what each candidate client returned.")
+        print(f"\nDebug log: {debug_log_path}")
+        return
+
+    # Use the first usable finding. (Could prompt user to pick if there
+    # are multiple, but in practice there'll be at most one.)
+    finding = findings[0]
+    print(f"[OK] device-flow init succeeded with client_id={finding['client_id']}.")
+    tokens = _interactive_device_flow_complete(s, finding, debug_log_path)
+    if not tokens:
+        return
+    if tokens.get("refresh_token") and tokens.get("access_token"):
+        print(
+            f"\n[OK] Your tokens (Keycloak-native — may need translation for HA):\n\n"
+            f"- Refresh Token: {tokens['refresh_token']}\n"
+            f"- Access Token:  {tokens['access_token']}\n"
+        )
+        print("NOTE: tokens issued by the backend Keycloak realm have")
+        print(f"      iss = {brand_config['backend_realm_url']}")
+        print("      whereas the CCSP API expects iss = 'uvo'. Test these")
+        print("      in Home Assistant; if they don't work, that's the")
+        print("      reason and we'd need a token-translation step.")
+
+
+def _run_keycloak_browser(region, brand, brand_config, headless=False):
+    """
+    Probe 8 entry point: drive a real Chrome browser through the
+    backend Keycloak login form (which has Google reCAPTCHA v3).
+    Triggered explicitly via --keycloak-browser; doesn't go through
+    the automatic probe chain.
+
+    DIAGNOSTIC ONLY: this proves the login UI + reCAPTCHA chain is
+    reachable end-to-end and captures the OAuth auth code, but does
+    NOT produce usable tokens (the marketing-client secret is
+    server-side at kia.com). See CHANGELOG v3.9.6 for the full
+    reasoning. For tokens, run the script with no flags.
+    """
+    debug_log_path = os.path.abspath(DEBUG_LOG_FILE)
+    try:
+        with open(debug_log_path, "w", encoding="utf-8") as f:
+            f.write(
+                f"{brand_config['name']} keycloak-browser log -- "
+                f"{dt.datetime.now():%Y-%m-%d %H:%M:%S}\n"
+            )
+    except OSError:
+        pass
+
+    print(f"Real-browser Keycloak login for {brand['name']} ({region['name']}).")
+    print("DIAGNOSTIC MODE: this proves the login chain is reachable end-to-end")
+    print("(login form + reCAPTCHA v3 + auth-code capture), but does NOT produce")
+    print("usable tokens -- Kia's marketing client requires a server-side secret")
+    print("that we cannot obtain (see CHANGELOG v3.9.6). For tokens, re-run")
+    print("without --keycloak-browser.")
+    print()
+    print("How it works: Chrome will open and log in at Kia's backend")
+    print("Keycloak server. Google's reCAPTCHA v3 runs invisibly -- your")
+    print("browser session is scored, and if it looks human enough, the")
+    print("login goes through. No password is shown anywhere; you type")
+    print("it once into this terminal and the script types it into the")
+    print("browser for you.")
+    print()
+    if headless:
+        print("Mode: HEADLESS (no Chrome window will appear). Higher risk")
+        print("of reCAPTCHA blocking; if it fails, retry without --headless.")
+    else:
+        print("Mode: VISIBLE (a Chrome window will appear). Don't close it")
+        print("manually -- the script will close it after login.")
+    print()
+    email = input("Email:    ").strip()
+    password = getpass.getpass("Password: ")
+    if not email or not password:
+        print("[ERROR] Email or password is empty. Aborting.")
+        return
+
+    print(f"\nStarting Chrome and navigating to {brand_config['backend_realm_url']}...\n")
+    try:
+        tokens = _probe_keycloak_browser(
+            brand_config, email, password, debug_log_path, headless=headless
+        )
+    except RuntimeError as exc:
+        print(f"[ERROR] {exc}")
+        print("Re-run pip install -r requirements.txt and try again.")
+        return
+
+    if tokens and tokens.get("refresh_token") and tokens.get("access_token"):
+        print(
+            f"\n[OK] Your tokens (Keycloak-native — may need translation for HA):\n\n"
+            f"- Refresh Token: {tokens['refresh_token']}\n"
+            f"- Access Token:  {tokens['access_token']}\n"
+        )
+        print("NOTE: tokens issued by the backend Keycloak realm have")
+        print(f"      iss = {brand_config['backend_realm_url']}")
+        print("      whereas the CCSP API expects iss = 'uvo'. Test these")
+        print("      in Home Assistant; if they don't work, see CHANGELOG")
+        print("      v3.9.0 for the architectural reason and possible")
+        print("      translation step.")
+    else:
+        print("[ERROR] Could not obtain tokens via real-browser login.")
+        print("Possible reasons:")
+        print("  - Wrong email or password")
+        print("  - Google reCAPTCHA v3 scored the browser session too low")
+        print(f"    (try without --keycloak-browser-headless for higher score)")
+        print("  - Kia changed the form structure")
+        print(f"\nDiagnostic log: {debug_log_path}")
+
+
 def main():
+    parser = argparse.ArgumentParser(
+        description="Get a Kia or Hyundai OAuth2 refresh token.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument(
+        "--debug-all-probes",
+        action="store_true",
+        help=(
+            "Diagnostic mode for Kia/Hyundai EU. Runs every probe in the "
+            "fallback chain in isolation, regardless of which one "
+            "succeeds, and prints a PASS/FAIL summary at the end. Use this "
+            "to verify that fallback paths still work (and aren't silently "
+            "broken until the primary fails). Takes ~30-60 seconds and "
+            "uses your credentials for every probe -- may trigger Kia's "
+            "rate limits if run too often."
+        ),
+    )
+    parser.add_argument(
+        "--device-flow",
+        action="store_true",
+        help=(
+            "EXPERIMENTAL Kia/Hyundai EU only: skip the regular probe chain "
+            "and try OAuth Device Flow at the backend Keycloak realm. "
+            "Sweeps candidate client_ids until one accepts a device-code "
+            "request, then prompts you to open the verification URL in any "
+            "browser and log in there. No password is sent from this "
+            "script in this mode. Tokens come from the backend realm "
+            "directly (Keycloak-native iss, may need translation for HA — "
+            "see CHANGELOG)."
+        ),
+    )
+    parser.add_argument(
+        "--keycloak-browser",
+        action="store_true",
+        help=(
+            "DIAGNOSTIC Kia/Hyundai EU only: launch a real Chrome browser "
+            "(via undetected-chromedriver), navigate the backend Keycloak "
+            "login form, pass reCAPTCHA v3, and capture the OAuth auth code. "
+            "Does NOT produce usable tokens -- the marketing-client secret "
+            "lives server-side at kia.com and the resulting code can't be "
+            "redeemed externally (see CHANGELOG v3.9.6). Useful as a "
+            "reachability check / forensic tool when investigating future "
+            "changes to Kia's auth surface. For tokens, use the default chain."
+        ),
+    )
+    parser.add_argument(
+        "--keycloak-browser-headless",
+        action="store_true",
+        help=(
+            "Implies --keycloak-browser and runs Chrome in headless mode. "
+            "More automation-friendly, but Google's reCAPTCHA v3 is more "
+            "likely to score a headless browser too low and reject the "
+            "login. Try this first; fall back to --keycloak-browser "
+            "(visible) if it fails."
+        ),
+    )
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"KiaHyundaiToken {__version__}",
+    )
+    args = parser.parse_args()
+
+    # --keycloak-browser-headless implies --keycloak-browser.
+    if args.keycloak_browser_headless:
+        args.keycloak_browser = True
+
     try:
         region, brand = select_region_and_brand()
 
-        # Kia EU is fully browserless via direct-API login. Every other
-        # region/brand still uses the OAuth-via-browser flow because (a)
-        # they don't sit behind AWS WAF Bot Control and (b) we don't have
-        # validated app constants (Service ID, App ID, CFB key) for them.
+        # --keycloak-browser short-circuits the probe chain entirely.
+        if args.keycloak_browser:
+            if region["name"] != "Europe" or brand["name"] not in ("Kia", "Hyundai"):
+                print("[NOTE] --keycloak-browser is only implemented for Kia/Hyundai EU.")
+                return
+            brand_cfg = (
+                KIA_EU_BRAND_CONFIG if brand["name"] == "Kia"
+                else HYUNDAI_EU_BRAND_CONFIG
+            )
+            _run_keycloak_browser(
+                region, brand, brand_cfg,
+                headless=args.keycloak_browser_headless,
+            )
+            return
+
+        # --device-flow short-circuits the probe chain entirely.
+        if args.device_flow:
+            if region["name"] != "Europe" or brand["name"] not in ("Kia", "Hyundai"):
+                print("[NOTE] --device-flow is only implemented for Kia/Hyundai EU.")
+                return
+            brand_cfg = (
+                KIA_EU_BRAND_CONFIG if brand["name"] == "Kia"
+                else HYUNDAI_EU_BRAND_CONFIG
+            )
+            _run_device_flow(region, brand, brand_cfg)
+            return
+
+        # Kia EU and Hyundai EU both go through the browserless
+        # direct-API path. Other regions still use the browser flow
+        # (we don't have validated app constants for them yet, and
+        # they don't seem to sit behind the same login form quirks).
         if region["name"] == "Europe" and brand["name"] == "Kia":
-            _run_kia_eu_direct(region, brand)
+            _run_eu_direct(region, brand, KIA_EU_BRAND_CONFIG, debug_all=args.debug_all_probes)
+        elif region["name"] == "Europe" and brand["name"] == "Hyundai":
+            _run_eu_direct(region, brand, HYUNDAI_EU_BRAND_CONFIG, debug_all=args.debug_all_probes)
         else:
+            if args.debug_all_probes:
+                print("[NOTE] --debug-all-probes only applies to Kia/Hyundai EU. Ignoring.")
             _run_browser_flow(region, brand)
     except KeyboardInterrupt:
         # Catches Ctrl+C during select prompts, email input, or the

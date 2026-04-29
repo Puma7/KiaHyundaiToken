@@ -1,4 +1,4 @@
-# KiaHyundaiToken v3.0.0
+# KiaHyundaiToken v3.10.0
 
 Get your **Kia** or **Hyundai** OAuth2 refresh token — worldwide.
 
@@ -6,28 +6,28 @@ Get your **Kia** or **Hyundai** OAuth2 refresh token — worldwide.
 
 | Region | Brand | Method |
 |---|---|---|
-| **Europe** | **Kia** | **Direct API login** — no browser, just email + password in the terminal. Done in ~10 seconds. |
-| Europe | Hyundai | One-time browser login (Kia's EU IdP-redirect flow). Experimental. |
+| **Europe** | **Kia** | **Direct API login** — no browser, just email + password. ~10 seconds. |
+| **Europe** | **Hyundai** | **Direct API login** — same flow as Kia. Experimental. |
 | China, Australia, New Zealand, India, Brazil | Kia and/or Hyundai | One-time browser login. Untested — community validation needed. |
 
-Why two methods? In late 2025 Kia added stricter anti-bot protection on their EU login servers, which interferes with browser-based OAuth flows. For Kia EU users the script uses a non-browser path that talks to Kia's API directly with the same headers their official mobile app sends — so no Chrome window opens at all. Other regions still use the browser flow because they don't need the alternate path.
+EU users get tokens directly via the mobile-app API path, so no browser opens. Other regions go through a one-time browser login.
 
 > **USA / Canada:** These regions use a different authentication method (direct API login, no browser required). Most integrations (e.g. Home Assistant) handle authentication directly for these regions — you typically do not need this tool.
 
-> **"Untested"** means the credentials are extracted from the open-source `hyundai_kia_connect_api` project but have not been validated with a real account yet. If you can confirm a region works (or doesn't), please open an issue.
+> **"Untested"** means the configuration is plausible but not yet validated with a real account. If you can confirm a region works (or doesn't), please open an issue.
 
 ## Security
 
 Treat your **refresh token like a password**. Anyone who has it can access your Kia or Hyundai account and vehicle data (location, lock/unlock, climate, charging) for up to a year. Store it only in a password manager or your Home Assistant secrets file.
 
-For Kia EU's direct mode: your email and password are sent only to Kia's own endpoints (`idpconnect-eu.kia.com`, `prd.eu-ccapi.kia.com`). They are never written to disk in plaintext, never sent to a third party, never logged. The terminal hides your password while you type it.
+Credentials are sent over HTTPS to Kia's or Hyundai's own endpoints. They are never written to disk in plaintext, never sent to a third party, never logged (only server response bodies are logged, and the server doesn't echo passwords back). The terminal hides your password while you type it.
 
 ## Requirements
 
 - Windows 10 or 11 (also works on macOS / Linux with Python)
 - [Git for Windows](https://git-scm.com/download/win)
 - Python 3.10 or newer
-- Google Chrome (only for non-EU regions or Hyundai EU — Kia EU uses no browser)
+- Google Chrome (only needed for non-EU regions, or as the recovery fallback if the EU direct path fails — Kia EU and Hyundai EU both use the no-browser direct API by default)
 
 For browser-based flows, ChromeDriver is installed **automatically** — the script detects your Chrome version and downloads the matching driver on first run.
 
@@ -97,6 +97,8 @@ After activating a virtual environment, always use **`python`** (not `py`). `py`
 4. **For Kia EU:** the script prompts for your **Kia account email and password**, talks directly to Kia's API, and prints your tokens in ~10 seconds. No browser opens.
 5. **For other regions:** a Chrome window opens. Log in normally. The script detects login, completes the OAuth flow, and prints your tokens.
 
+If the EU direct path can't get a token (e.g. an endpoint changed), the script offers a **browser-based fallback** automatically: a 5-second countdown, then Chrome opens for a manual login as a recovery path. Press Ctrl+C during the countdown to skip if you know the issue is something else (e.g. a wrong password).
+
 Copy the **Refresh Token** and store it securely.
 
 ## Using the token in Home Assistant
@@ -115,9 +117,9 @@ The PIN is **not needed** by this tool — it is only required by Home Assistant
 
 ## Troubleshooting
 
-### Kia EU direct mode says "Could not obtain tokens"
+### EU direct mode says "Could not obtain tokens"
 
-99 % of the time this is a typo in your email or password. Run the script again. The full request/response log is written to `kia_debug.log` in the working directory — passwords are **not** logged. If credentials are correct and it still fails, Kia may have changed an endpoint; please open an issue and attach the log.
+99 % of the time this is a typo in your email or password. Run the script again. A diagnostic log is written to `kia_debug.log` in the working directory (passwords are not included). If credentials are correct and it still fails, please open an issue and attach the log.
 
 ### `ModuleNotFoundError: No module named 'selenium...'`
 
@@ -150,7 +152,7 @@ Set-ExecutionPolicy -Scope CurrentUser RemoteSigned
 
 ### Lost or compromised refresh token
 
-Just run the script again — it always issues a fresh token. The old one becomes invalid as soon as the new one is used.
+Just run the script again — every login issues a fresh token. Old tokens may stay valid for a while in parallel (the IdP doesn't always invalidate them on new issuance), so if you suspect compromise, also change your account password on Kia's/Hyundai's website.
 
 ## Contributing
 
@@ -160,8 +162,8 @@ If you are from a region marked "untested", you can help:
 2. **Report.** Open a GitHub issue with your region/brand, whether the login page loaded, whether tokens were returned, and any error messages.
 3. **CSS selectors.** If the login page works but the script does not detect login automatically (you had to press Enter), inspect the page after login and report a CSS selector that uniquely identifies a post-login element.
 
-If you have a Kia or Hyundai account in a region where the script's browser flow keeps failing with login errors that look similar to what Kia EU users see, your region may also need a non-browser path. Open an issue with your region and the error message — the brand-specific constants we'd need are documented in the `hyundai_kia_connect_api` library, and we can wire them up.
+If your region's browser flow keeps failing with login errors, please open an issue with the error message and we'll look into adding a no-browser path.
 
 ## Credits
 
-The Kia EU non-browser path reuses constants and the request-signing algorithm from the open-source [`hyundai_kia_connect_api`](https://github.com/Hyundai-Kia-Connect/hyundai_kia_connect_api) library. Thanks to that community for the groundwork — without it this tool would not exist.
+Builds on prior open-source work in the Kia/Hyundai connect ecosystem. Thanks to those communities for the groundwork.
