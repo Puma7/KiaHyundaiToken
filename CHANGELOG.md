@@ -1,5 +1,74 @@
 # Changelog
 
+## [3.10.0] - 2026-04-29
+
+### Production hardening + boundary cleanup
+
+After settling Probe 8's structural disposition in v3.9.6, this
+release tightens up the production edges. No behavior change for
+the working default chain; just removes the rough corners.
+
+### Edge cases fixed
+
+1. **Selenium / chromedriver-autoinstaller now lazy-imported.**
+   Previously the module always imported these at the top, so a
+   broken Chrome stack (uninstalled package, conflicting Selenium
+   version, missing chromedriver) crashed even `--version` and
+   `--help`. EU users on the REST-API path don't need a browser at
+   all and were being held hostage by the Chrome dependency.
+   Imports now sit behind a try/except; the entry points
+   `create_driver()` and `_probe_keycloak_browser()` call a new
+   `_require_selenium()` guard that raises a friendly RuntimeError
+   pointing the user at `pip install -r requirements.txt`. The EU
+   direct chain (Probes 0-7), `--version`, and `--help` work even
+   if Chrome is uninstallable.
+
+2. **ASCII-safe stdout for all user-facing prints.** Every `print()`
+   that the user sees on stdout now uses pure ASCII -- em-dashes
+   (`--`), en-dashes (`-`) -- so the script renders correctly in
+   classic Windows cmd / older PowerShell terminals where the
+   default code page isn't UTF-8. Markdown documentation and source
+   comments still use real Unicode; only stdout was tightened.
+
+3. **Stale messaging fixed.** `_run_eu_direct` now reports the
+   actual number of probes via `len(PROBE_RUNNERS)` instead of the
+   hardcoded "all 6 probes" (the chain has 8). The
+   `--debug-all-probes` help text dropped the stale "(0..6)" range.
+   The `--keycloak-browser` help text was rewritten to match v3.9.6
+   reality: it's labeled DIAGNOSTIC, not "futureproof fallback",
+   and explicitly notes that no usable tokens are produced. The
+   in-flow banner of `_run_keycloak_browser` got the same honest
+   reframing.
+
+4. **Security reminder on token success.** After printing a refresh
+   token to stdout, `_run_eu_direct` now also prints a one-liner
+   reminding the user that the token is password-equivalent and
+   must be stored securely. The reminder is short enough not to
+   bury the token; long enough to actually register.
+
+### Verified
+
+- `python -m py_compile get_token.py` clean.
+- `--version` returns `KiaHyundaiToken 3.10.0`.
+- `--help` builds without errors and contains no stale "0..6" /
+  "futureproof" strings.
+- `_require_selenium()` raises the intended RuntimeError when
+  either dependency is simulated as missing.
+- All 8 PROBE_RUNNERS are present and callable.
+- KIA_EU_BRAND_CONFIG retains every required field.
+- PKCE pair generator (v3.9.2) still produces RFC 7636 outputs.
+- Probe 8's diagnostic-conclusion path doesn't NameError on
+  `auth_code` (initialized before the failure branch).
+
+### Status
+
+The default chain (no flags) is the production path. EU users get
+tokens in ~10 seconds without a browser. Probe 8
+(`--keycloak-browser`) is honestly framed as a diagnostic; users
+who just want tokens never see it. The script is now resilient to
+a broken Chrome stack on machines where only the EU REST path is
+needed.
+
 ## [3.9.6] - 2026-04-29
 
 ### Honest disposition for Probe 8 + expanded secret-guess sweep

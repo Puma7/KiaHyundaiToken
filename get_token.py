@@ -15,7 +15,7 @@ gets at least one chance to recover.
 See README for usage and CHANGELOG for version history.
 """
 
-__version__ = "3.9.6"
+__version__ = "3.10.0"
 
 import argparse
 import base64
@@ -30,14 +30,42 @@ import secrets
 import shutil
 import time
 
-from selenium import webdriver
-from selenium.webdriver.chrome.service import Service
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
-from selenium.common.exceptions import TimeoutException, WebDriverException
+# Selenium + chromedriver_autoinstaller are only needed for the
+# browser-based flows (non-EU regions, --keycloak-browser). EU users
+# (Kia/Hyundai EU) hit the REST API path and never need a browser at
+# all, so a broken Chrome stack must NOT block them. Wrap the imports
+# in a try/except and let browser-flow callers raise a friendly error
+# at call time if these turn out to be missing.
+try:
+    from selenium import webdriver
+    from selenium.webdriver.chrome.service import Service
+    from selenium.webdriver.common.by import By
+    from selenium.webdriver.support.ui import WebDriverWait
+    from selenium.webdriver.support import expected_conditions as EC
+    from selenium.common.exceptions import TimeoutException, WebDriverException
+    _SELENIUM_IMPORT_ERROR = None
+except ImportError as _exc:
+    webdriver = None
+    Service = None
+    By = None
+    WebDriverWait = None
+    EC = None
+
+    class TimeoutException(Exception):
+        pass
+
+    class WebDriverException(Exception):
+        pass
+
+    _SELENIUM_IMPORT_ERROR = _exc
+
 import requests
-import chromedriver_autoinstaller
+try:
+    import chromedriver_autoinstaller
+    _CHROMEDRIVER_AUTOINSTALL_ERROR = None
+except ImportError as _exc:
+    chromedriver_autoinstaller = None
+    _CHROMEDRIVER_AUTOINSTALL_ERROR = _exc
 
 session = requests.Session()
 
@@ -422,11 +450,34 @@ def _safe_truncate(value, limit=80):
     return text if len(text) <= limit else text[:limit] + "..."
 
 
+def _require_selenium():
+    """
+    Browser-flow entry guard: raise a friendly error if selenium or
+    chromedriver_autoinstaller failed to import at module load time.
+    EU users (REST API path) never reach this; this protects only the
+    paths that actually need a browser.
+    """
+    if _SELENIUM_IMPORT_ERROR is not None:
+        raise RuntimeError(
+            "Browser-based flow requires selenium, but it failed to import: "
+            f"{_SELENIUM_IMPORT_ERROR}. Run 'python -m pip install -r "
+            "requirements.txt' to install all dependencies."
+        )
+    if _CHROMEDRIVER_AUTOINSTALL_ERROR is not None:
+        raise RuntimeError(
+            "Browser-based flow requires chromedriver-autoinstaller, but it "
+            f"failed to import: {_CHROMEDRIVER_AUTOINSTALL_ERROR}. Run "
+            "'python -m pip install -r requirements.txt' to install all "
+            "dependencies."
+        )
+
+
 def create_driver(user_agent):
     """
     Install chromedriver and start Chrome with anti-detection flags.
     Raises RuntimeError if Chrome cannot be started.
     """
+    _require_selenium()
     return _create_standard_driver(user_agent)
 
 
@@ -1371,7 +1422,7 @@ def _interactive_device_flow_complete(s, finding, log_path):
     """
     print()
     print("=" * 60)
-    print("DEVICE FLOW — interactive login")
+    print("DEVICE FLOW -- interactive login")
     print("=" * 60)
     print()
     print("Open this URL in any browser (your phone is fine):")
@@ -1434,7 +1485,7 @@ def _interactive_device_flow_complete(s, finding, log_path):
             print("(slowing down)", end=" ", flush=True)
             continue
         if err == "expired_token":
-            print("\n[ERROR] Device code expired — start over.")
+            print("\n[ERROR] Device code expired -- start over.")
             return None
         if err == "access_denied":
             print("\n[ERROR] Authorization denied on the verification page.")
@@ -1831,6 +1882,7 @@ def _probe_keycloak_browser(brand_config, email, password, log_path,
     acquisition, rely on the default Probe 0-2 chain. See the v3.9.6
     changelog entry for the full reasoning and forward-looking notes.
     """
+    _require_selenium()  # we use WebDriverWait/EC/By/WebDriverException
     try:
         import undetected_chromedriver as uc
     except ImportError as exc:
@@ -1917,7 +1969,7 @@ def _probe_keycloak_browser(brand_config, email, password, log_path,
 
     driver = None
     try:
-        print("[Probe 8] Starting undetected Chrome — first run downloads "
+        print("[Probe 8] Starting undetected Chrome -- first run downloads "
               "ChromeDriver, this can take 10-30 seconds...")
         driver = uc.Chrome(
             options=options,
@@ -2747,7 +2799,7 @@ def _run_eu_direct(region, brand, brand_config, debug_all=False):
     try:
         with open(debug_log_path, "w", encoding="utf-8") as f:
             f.write(
-                f"{brand_config['name']} direct-API debug log — "
+                f"{brand_config['name']} direct-API debug log -- "
                 f"{dt.datetime.now():%Y-%m-%d %H:%M:%S}\n"
             )
     except OSError:
@@ -2756,7 +2808,7 @@ def _run_eu_direct(region, brand, brand_config, debug_all=False):
     host_short = brand_config["host"].replace("https://", "")
     redirect_short = brand_config["redirect_uri"].replace("https://", "").split("/")[0]
 
-    print(f"Logging into {brand['name']} ({region['name']}) — no browser needed.\n")
+    print(f"Logging into {brand['name']} ({region['name']}) -- no browser needed.\n")
     if debug_all:
         print("*** DEBUG-ALL mode: every probe will run, even after one succeeds.")
         print("    Takes ~30-60s. A summary table prints at the end.")
@@ -2772,9 +2824,9 @@ def _run_eu_direct(region, brand, brand_config, debug_all=False):
         return
 
     if debug_all:
-        print("\nRunning all 6 probes — this takes a while...\n")
+        print(f"\nRunning all {len(PROBE_RUNNERS)} probes -- this takes a while...\n")
     else:
-        print("\nFetching token (typically 5–15 seconds)...\n")
+        print("\nFetching token (typically 5-15 seconds)...\n")
     try:
         tokens = eu_direct_probe(
             email, password, brand_config, debug_log_path, debug_all=debug_all
@@ -2789,8 +2841,11 @@ def _run_eu_direct(region, brand, brand_config, debug_all=False):
         print(
             f"[OK] Your tokens are:\n\n"
             f"- Refresh Token: {tokens['refresh_token']}\n"
-            f"- Access Token:  {tokens['access_token']}"
+            f"- Access Token:  {tokens['access_token']}\n"
         )
+        print("Treat the refresh token like a password. Anyone holding it can")
+        print("control your vehicle. Store it in a password manager or your")
+        print("Home Assistant secrets file -- never in plain text.")
         return
 
     # ----------------------------------------------------------------
@@ -2803,7 +2858,7 @@ def _run_eu_direct(region, brand, brand_config, debug_all=False):
     # ----------------------------------------------------------------
     print("[ERROR] Could not obtain tokens via the direct API. Reasons in")
     print("order of likelihood:")
-    print("  - Wrong email or password (most common — re-check)")
+    print("  - Wrong email or password (most common -- re-check)")
     print(f"  - {brand['name']} changed an endpoint (rare)")
     print(f"\nDiagnostic log: {debug_log_path}")
     print("(Passwords are not logged.)\n")
@@ -2969,7 +3024,7 @@ def _run_device_flow(region, brand, brand_config):
     try:
         with open(debug_log_path, "w", encoding="utf-8") as f:
             f.write(
-                f"{brand_config['name']} device-flow log — "
+                f"{brand_config['name']} device-flow log -- "
                 f"{dt.datetime.now():%Y-%m-%d %H:%M:%S}\n"
             )
     except OSError:
@@ -2978,7 +3033,7 @@ def _run_device_flow(region, brand, brand_config):
     print(f"Device flow login for {brand['name']} ({region['name']}).")
     print("This is an experimental path. You will log in on a verification")
     print("URL in any browser (your phone is fine), and this script will")
-    print("pick up the tokens once you're done — no password is sent from")
+    print("pick up the tokens once you're done -- no password is sent from")
     print("this script.\n")
 
     try:
@@ -3026,25 +3081,33 @@ def _run_keycloak_browser(region, brand, brand_config, headless=False):
     Probe 8 entry point: drive a real Chrome browser through the
     backend Keycloak login form (which has Google reCAPTCHA v3).
     Triggered explicitly via --keycloak-browser; doesn't go through
-    the automatic probe chain. Tokens are Keycloak-native (iss=
-    backend realm), may need translation for Home Assistant.
+    the automatic probe chain.
+
+    DIAGNOSTIC ONLY: this proves the login UI + reCAPTCHA chain is
+    reachable end-to-end and captures the OAuth auth code, but does
+    NOT produce usable tokens (the marketing-client secret is
+    server-side at kia.com). See CHANGELOG v3.9.6 for the full
+    reasoning. For tokens, run the script with no flags.
     """
     debug_log_path = os.path.abspath(DEBUG_LOG_FILE)
     try:
         with open(debug_log_path, "w", encoding="utf-8") as f:
             f.write(
-                f"{brand_config['name']} keycloak-browser log — "
+                f"{brand_config['name']} keycloak-browser log -- "
                 f"{dt.datetime.now():%Y-%m-%d %H:%M:%S}\n"
             )
     except OSError:
         pass
 
     print(f"Real-browser Keycloak login for {brand['name']} ({region['name']}).")
-    print("EXPERIMENTAL: this is the futureproof fallback for the day Kia")
-    print("locks down the REST API used by the regular probe chain.")
+    print("DIAGNOSTIC MODE: this proves the login chain is reachable end-to-end")
+    print("(login form + reCAPTCHA v3 + auth-code capture), but does NOT produce")
+    print("usable tokens -- Kia's marketing client requires a server-side secret")
+    print("that we cannot obtain (see CHANGELOG v3.9.6). For tokens, re-run")
+    print("without --keycloak-browser.")
     print()
     print("How it works: Chrome will open and log in at Kia's backend")
-    print("Keycloak server. Google's reCAPTCHA v3 runs invisibly — your")
+    print("Keycloak server. Google's reCAPTCHA v3 runs invisibly -- your")
     print("browser session is scored, and if it looks human enough, the")
     print("login goes through. No password is shown anywhere; you type")
     print("it once into this terminal and the script types it into the")
@@ -3055,7 +3118,7 @@ def _run_keycloak_browser(region, brand, brand_config, headless=False):
         print("of reCAPTCHA blocking; if it fails, retry without --headless.")
     else:
         print("Mode: VISIBLE (a Chrome window will appear). Don't close it")
-        print("manually — the script will close it after login.")
+        print("manually -- the script will close it after login.")
     print()
     email = input("Email:    ").strip()
     password = getpass.getpass("Password: ")
@@ -3105,11 +3168,11 @@ def main():
         action="store_true",
         help=(
             "Diagnostic mode for Kia/Hyundai EU. Runs every probe in the "
-            "fallback chain (0..6) in isolation, regardless of which one "
+            "fallback chain in isolation, regardless of which one "
             "succeeds, and prints a PASS/FAIL summary at the end. Use this "
             "to verify that fallback paths still work (and aren't silently "
             "broken until the primary fails). Takes ~30-60 seconds and "
-            "uses your credentials for every probe — may trigger Kia's "
+            "uses your credentials for every probe -- may trigger Kia's "
             "rate limits if run too often."
         ),
     )
@@ -3131,14 +3194,14 @@ def main():
         "--keycloak-browser",
         action="store_true",
         help=(
-            "EXPERIMENTAL Kia/Hyundai EU only: launch a real Chrome browser "
+            "DIAGNOSTIC Kia/Hyundai EU only: launch a real Chrome browser "
             "(via undetected-chromedriver), navigate the backend Keycloak "
-            "login form, and let Google's reCAPTCHA v3 run naturally in "
-            "the browser. This is the futureproof fallback for the day "
-            "Probes 0/1/2 (the REST API path) get locked down. Slow (~15-30s) "
-            "and visible by default — use --keycloak-browser-headless for "
-            "headless mode (higher risk of reCAPTCHA blocking). Tokens are "
-            "Keycloak-native (iss=backend realm), may need translation for HA."
+            "login form, pass reCAPTCHA v3, and capture the OAuth auth code. "
+            "Does NOT produce usable tokens -- the marketing-client secret "
+            "lives server-side at kia.com and the resulting code can't be "
+            "redeemed externally (see CHANGELOG v3.9.6). Useful as a "
+            "reachability check / forensic tool when investigating future "
+            "changes to Kia's auth surface. For tokens, use the default chain."
         ),
     )
     parser.add_argument(
