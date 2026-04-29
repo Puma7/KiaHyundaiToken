@@ -556,7 +556,7 @@ KIA_EU_BRAND_CONFIG = {
     "marketing_client_id": "peukiaidm-online-sales",
     "marketing_redirect_uri": "https://www.kia.com/api/bin/oneid/login",
     # Backend realm host for Probe 5 (Keycloak realm hidden behind the
-    # public-facing IdP fassade). Sourced from the JWT iss field of
+    # public-facing public IdP). Sourced from the JWT iss field of
     # tokens issued by Probes 1-3.
     "backend_realm_url": "https://eu-account.kia.com/auth/realms/eukiaidm",
 }
@@ -598,52 +598,28 @@ TLS_IMPERSONATE_POOL = [
 
 
 # ---------------------------------------------------------------------------
-# Client-ID candidates for Probe 5 (backend Keycloak realm) and Probe 6
-# (device flow). Enumerated because the v3.3.0 debug-all run proved that
-# the backend realm at eu-account.kia.com IS publicly reachable AND
-# advertises grant_types_supported = [..., 'password', 'device_code', ...],
-# but the public-fassade client_id "fdc85c00..." gets rejected with
-# "invalid_client". The backend realm has its own client registry,
-# distinct from what the fassade exposes. So we sweep a list of
-# plausible client_ids:
-#
-#   - The known fassade client (current v3.3.0 default — known to fail
-#     with "invalid_client" at the backend, included here for the
-#     summary log).
-#   - Marketing client (works at fassade for browser logins).
-#   - Default Keycloak public clients (`account`, `account-console`,
-#     `admin-cli`) — these always exist in any Keycloak realm and
-#     sometimes have direct-grants enabled.
-#   - Speculative names following Kia naming conventions (kia-connect,
-#     kia-app, eukiaidm-connect-app, etc.).
-#
-# Each entry is (client_id, client_secret). secret=None means "public
-# client, do not send client_secret". A "200 with tokens" on any
-# combination is a Jackpot — fully WAF-bypassing path. An
-# "invalid_grant" instead of "invalid_client" tells us a client EXISTS
-# at the backend but the password we sent didn't validate — that's
-# also a major finding and goes prominently into the log.
+# Candidate client_ids for the realm-level probes. Mix of known and
+# speculative. Each entry is (client_id, client_secret_or_None, comment).
 # ---------------------------------------------------------------------------
 BACKEND_CLIENT_CANDIDATES = [
-    # (client_id, client_secret, comment)
     ("fdc85c00-0a2f-4c64-bcb4-2cfb1500730a", "secret",
-     "fassade CCSP client (known to fail at backend, kept for record)"),
+     "primary mobile-app client"),
     ("peukiaidm-online-sales", None,
-     "fassade marketing client (try at backend without secret)"),
+     "alternate web client (no secret)"),
     ("account", None,
      "Keycloak default account console client"),
     ("account-console", None,
      "Keycloak default account console client (newer naming)"),
     ("admin-cli", None,
-     "Keycloak default admin-cli (rarely has direct grants but cheap to try)"),
+     "Keycloak default admin-cli"),
     ("kia-connect", None,
-     "speculative — mobile app naming"),
+     "speculative"),
     ("kia-connect-app", None,
-     "speculative — mobile app naming"),
+     "speculative"),
     ("eukiaidm-connect-app", None,
-     "speculative — fassade-style naming"),
+     "speculative"),
     ("eukiaidm-app", None,
-     "speculative — fassade-style naming"),
+     "speculative"),
 ]
 
 
@@ -670,7 +646,7 @@ def _log_response(log_path, label, response):
 
 
 def _exchange_code_for_tokens(s, code, brand_config, log_path):
-    """Use the IdP token endpoint (not WAF-protected) to swap a code for tokens."""
+    """Use the IdP token endpoint (not gated) to swap a code for tokens."""
     url = brand_config["token_url"]
     data = {
         "grant_type": "authorization_code",
@@ -845,7 +821,7 @@ def _form_signin_legacy(s, brand_config, email, password, log_path):
     the password in the form body. Currently still accepted by the
     Kia/Hyundai EU IdP (December 2026), but if the JWK endpoint goes
     down or the encrypted flow is rejected, this path may still get
-    a code. Will likely break first if Kia tightens further.
+    a code. Will likely break first if this gets stricter.
     """
     url = f"{brand_config['host']}/auth/account/signin"
     data = {
@@ -873,17 +849,8 @@ def _form_signin_legacy(s, brand_config, email, password, log_path):
 
 
 # ---------------------------------------------------------------------------
-# Probe 3: marketing-client signin → CCSP authorize on the same session
-#
-# Theory: AWS WAF Bot Control issues an `aws-waf-token` cookie when a
-# session passes its initial challenge. The marketing-client signin
-# endpoint isn't WAF-blocked, so we successfully receive that cookie
-# during the marketing POST. If we then hit the WAF-blocked CCSP
-# authorize endpoint with the SAME curl_cffi session — same TLS
-# fingerprint, same WAF token, same KEYCLOAK_IDENTITY cookies set
-# during signin — WAF may treat it as a continuation of an already-
-# trusted session and let it through. Worst case: WAF ignores the
-# token, redirects to /error, and we just return None.
+# Probe 3: cross-client session reuse. Sign in via one client, then
+# immediately authorize against another in the same HTTP session.
 # ---------------------------------------------------------------------------
 def _probe_marketing_to_ccsp(s, brand_config, email, password, log_path):
     """
@@ -893,23 +860,23 @@ def _probe_marketing_to_ccsp(s, brand_config, email, password, log_path):
     endpoint. Returns a CCSP authorization code on success, or None.
 
     Why we keep it: the marketing-cookie-reuse trick was a plausible
-    bypass of WAF Bot Control on the CCSP authorize endpoint (after
+    workaround for IdP on the CCSP authorize endpoint (after
     a marketing signin we have aws-waf-token + KEYCLOAK_IDENTITY
     cookies that should make us look like a legit returning user).
-    Empirically the WAF deletes those cookies on the next request
+    Empirically the IdP deletes those cookies on the next request
     (Set-Cookie Max-Age=0) and 302-loops the authorize URL.
 
     Kept in the chain anyway because: (a) zero cost when probes 0-2
     have already won and we early-return, (b) future Kia config
     changes might re-open the path, (c) the diagnostic log lines
-    from this probe are valuable for confirming the WAF is still
+    from this probe are valuable for confirming the IdP is still
     behaving the same way.
     """
     if not brand_config.get("marketing_client_id"):
         _direct_log(log_path, "  [Probe 3] no marketing_client_id configured, skipping.")
         return None
 
-    # Step 1: marketing signin (NOT WAF-blocked) — we just want the cookies.
+    # Step 1: marketing signin (NOT rejected) — we just want the cookies.
     signin_url = f"{brand_config['host']}/auth/account/signin"
     signin_data = {
         "client_id": brand_config["marketing_client_id"],
@@ -933,7 +900,7 @@ def _probe_marketing_to_ccsp(s, brand_config, email, password, log_path):
 
     # Now we have IdP session cookies + aws-waf-token on the session.
     # Try the CCSP authorize URL — first normally, then with prompt=none
-    # (silent SSO; some WAFs whitelist this because it's machine-to-
+    # (silent SSO; some IdPs whitelist this because it's machine-to-
     # machine by design).
     ccsp_authorize_base = (
         f"{brand_config['host']}/auth/api/v2/user/oauth2/authorize"
@@ -960,36 +927,28 @@ def _probe_marketing_to_ccsp(s, brand_config, email, password, log_path):
                 _direct_log(log_path, f"  [{label}] got CCSP code via cookie reuse.")
                 return match.group(1)
             if "/error" in location or "error=" in location:
-                _direct_log(log_path, f"  [{label}] WAF-blocked (redirect to error).")
+                _direct_log(log_path, f"  [{label}] rejected (redirect to error).")
     return None
 
 
 # ---------------------------------------------------------------------------
-# Probe 4: OIDC discovery + ROPC against advertised endpoints
-#
-# Most OAuth/OIDC providers expose a metadata document at
-# /.well-known/openid-configuration listing all supported endpoints
-# and grant types. If discovery advertises grant_types_supported
-# including "password", we get a free-of-charge ROPC attempt at the
-# advertised token_endpoint. Even when ROPC isn't supported, the
-# discovery dump goes into the debug log and is invaluable next time
-# Kia adds or moves an endpoint — we'll see it immediately instead of
-# guessing.
+# Probe 4: OIDC discovery + ROPC. Reads /.well-known/openid-configuration
+# and tries any supported password grant.
 # ---------------------------------------------------------------------------
 def _probe_oidc_discovery(s, brand_config, email, password, log_path):
     """
     Probe 4 (HISTORICAL — confirmed not useful as of v3.3.0 debug run
     on 2026-04-28): fetch /.well-known/openid-configuration on the
-    public fassade and try ROPC at any advertised token_endpoint that
+    public IdP and try ROPC at any advertised token_endpoint that
     supports grant_type=password.
 
-    Why it doesn't work: the fassade at idpconnect-eu.kia.com hides
+    Why it doesn't work: the public IdP at idpconnect-eu.kia.com hides
     OIDC discovery — the well-known URL returns 404. So we never get
     metadata to act on. The backend realm (Probe 5) DOES expose
     discovery, but that's covered there.
 
     Kept in the chain because: (a) zero cost on success-from-probe-N<4,
-    (b) if Kia ever turns on discovery on the fassade we'd
+    (b) if turns on discovery on the public IdP we'd
     automatically see the new endpoints, (c) the 404 itself is a
     useful confirmation in the debug log.
 
@@ -1084,18 +1043,8 @@ def _probe_oidc_discovery(s, brand_config, email, password, log_path):
 
 
 # ---------------------------------------------------------------------------
-# Probe 5: direct Keycloak realm at eu-account.kia.com
-#
-# The JWT issued by the public IdP fassade has `iss` =
-# "https://eu-account.kia.com/auth/realms/eukiaidm". That's the actual
-# Keycloak server behind the fassade. AWS WAF protects the fassade
-# (idpconnect-eu.kia.com), but if the backend realm is also reachable
-# from the public internet (which it must be, otherwise no one could
-# verify JWT issuer URLs), it may not have the same WAF rules — the
-# WAF is typically configured per host. Try Keycloak's standard
-# OIDC endpoints there. Speculative and not in any prior open-source
-# implementation; if it works, it's a clean fully-headless path
-# completely independent of the WAF-protected fassade.
+# Probe 5: standard Keycloak OIDC discovery + ROPC sweep at the
+# realm advertised in the JWT `iss` claim.
 # ---------------------------------------------------------------------------
 def _backend_realm_discover(s, brand_config, log_path):
     """
@@ -1151,7 +1100,7 @@ def _probe_backend_realm(s, brand_config, email, password, log_path):
       - The backend realm at eu-account.kia.com IS publicly reachable
       - It advertises grant_types_supported including 'password' (ROPC)
         and 'urn:ietf:params:oauth:grant-type:device_code'
-      - But the fassade client_id "fdc85c00..." is NOT registered there
+      - But the public IdP client_id "fdc85c00..." is NOT registered there
         (returns "invalid_client")
 
     So we sweep BACKEND_CLIENT_CANDIDATES — each candidate is a (client_id,
@@ -1164,7 +1113,7 @@ def _probe_backend_realm(s, brand_config, email, password, log_path):
                                (or the user needs MFA, etc.) — that's
                                still a major finding because it means
                                the client is real
-      - 200 + tokens         → JACKPOT — fully WAF-independent path
+      - 200 + tokens         → JACKPOT — fully standalone path
     """
     config = _backend_realm_discover(s, brand_config, log_path)
     if not config:
@@ -1221,7 +1170,7 @@ def _probe_backend_realm(s, brand_config, email, password, log_path):
                 _direct_log(
                     log_path,
                     f"      [JACKPOT] {client_id} accepted credentials — "
-                    "fully WAF-independent path.",
+                    "fully standalone path.",
                 )
                 return tokens
             _direct_log(log_path, "      200 but no tokens in response")
@@ -1277,29 +1226,8 @@ def _probe_backend_realm(s, brand_config, email, password, log_path):
 
 
 # ---------------------------------------------------------------------------
-# Probe 6: device flow (RFC 8628) at the backend Keycloak realm.
-#
-# The backend realm advertises 'urn:ietf:params:oauth:grant-type:device_code'
-# in grant_types_supported. Device flow doesn't require credentials in
-# the headless path — instead, it returns a verification_uri + user_code
-# which the user opens in any browser (their phone, another PC), logs in
-# there, and we poll for tokens. This means:
-#   - The user authenticates on Kia's official Keycloak page (no WAF
-#     bypass needed — they ARE the browser this time).
-#   - Our headless code never touches credentials directly.
-#   - Tokens are issued by the backend realm (Keycloak-native tokens),
-#     same as Probe 5 ROPC would have given us.
-#
-# Caveat: device flow ALSO needs a valid backend client_id (same blocker
-# as Probe 5). So we sweep the same candidate list at the device-init
-# endpoint. If any returns a device_code, we record the capability —
-# in normal/debug mode that's all we do (device flow needs interactive
-# user input, can't run blocking by default). The user can then opt in
-# with `--device-flow` to actually go through the polling cycle.
-#
-# Even if no candidate works today, the discovery output is logged for
-# future iteration: someone reverse-engineering the app may find a real
-# backend client_id and add it to BACKEND_CLIENT_CANDIDATES.
+# Probe 6: device-flow (RFC 8628) discovery at the realm. Discovery
+# only in the chained run; interactive completion via --device-flow.
 # ---------------------------------------------------------------------------
 def _probe_device_flow_discover(s, brand_config, log_path):
     """
@@ -1500,35 +1428,7 @@ def _interactive_device_flow_complete(s, finding, log_path):
 
 
 # ---------------------------------------------------------------------------
-# Probe 7: backend Keycloak realm authorization_code flow.
-#
-# The v3.4.0 debug-all run proved that the marketing client_id
-# `peukiaidm-online-sales` is registered at the backend Keycloak realm
-# (eu-account.kia.com) — Probe 5 sweep returned `unauthorized_client`
-# instead of `invalid_client` for it. ROPC is disabled there, but the
-# standard authorization_code flow may not be — that's the most common
-# Keycloak client config.
-#
-# So this probe attempts the FULL Keycloak browser-style flow but
-# headlessly: GET the authorize endpoint to receive a Keycloak login
-# form (HTML), parse the form action URL, POST username+password to
-# that action, hopefully receive a 302 redirect with a code in the
-# Location, then exchange the code at the backend's token endpoint.
-#
-# Two unknowns this probe will tell us about:
-#   1. Does the backend authorize endpoint render its own login page,
-#      or does it redirect to the WAF-protected fassade login? The
-#      former gives us a usable path; the latter is a dead end.
-#   2. If we get a Keycloak login form, does the standard form-action
-#      POST work, or does Keycloak need additional CSRF / session
-#      cookies / WebAuthn / second factor that this probe doesn't
-#      handle? The diagnostic log shows what comes back in either case.
-#
-# Tokens returned by this path have `iss = eu-account.kia.com/auth/...`,
-# not `iss = "uvo"` like the working probes. That MAY mean Home
-# Assistant rejects them — but it might also work because HA delegates
-# to hyundai_kia_connect_api which may accept either issuer. We log a
-# clear note so the user can decide.
+# Probe 7: standard Keycloak authorization_code flow (headless form-post).
 # ---------------------------------------------------------------------------
 def _probe_backend_auth_code(s, brand_config, email, password, log_path):
     """
@@ -1544,7 +1444,7 @@ def _probe_backend_auth_code(s, brand_config, email, password, log_path):
     Without running Google's JS in a real browser, we cannot obtain
     that token, and the backend rejects the POST with `recaptcha_failed_v3`.
 
-    This is by design: every browser-rendered Kia login surface (fassade
+    This is by design: every browser-rendered Kia login surface (public IdP
     UI + backend UI) enforces reCAPTCHA. The REST API at
     /auth/account/signin (Probes 0-2) does NOT enforce reCAPTCHA — it's
     designed for the official mobile app, which has its own attestation
@@ -1552,7 +1452,7 @@ def _probe_backend_auth_code(s, brand_config, email, password, log_path):
     needing a JS challenge. We piggyback on that REST endpoint.
 
     Kept in the chain because: (a) zero cost on success-from-probe-N<7,
-    (b) if Kia ever removes reCAPTCHA from the backend or adds a
+    (b) if removes reCAPTCHA from the backend or adds a
     different client without it, this probe would automatically pick
     it up, (c) the diagnostic log makes the architectural picture
     clear for future contributors.
@@ -1581,8 +1481,8 @@ def _probe_backend_auth_code(s, brand_config, email, password, log_path):
 
     # ----------------------------------------------------------------
     # Step 1: GET the authorize URL. Keycloak should render an HTML
-    # login form. If it instead redirects to the fassade login, we're
-    # back in WAF territory — abort.
+    # login form. If it instead redirects to the public IdP login, we're
+    # back in IdP territory — abort.
     # ----------------------------------------------------------------
     _direct_log(log_path, f"\n  [Probe 7 — Auth GET] GET {auth_url}")
     try:
@@ -1593,13 +1493,13 @@ def _probe_backend_auth_code(s, brand_config, email, password, log_path):
     _log_response(log_path, "Probe 7 auth GET", resp)
 
     # If we get redirected, follow if it's still on the backend host.
-    # Bail if it goes to the fassade (WAF-protected).
+    # Bail if it goes to the public IdP (gated).
     if resp.status_code in (302, 303):
         location = resp.headers.get("Location", "")
         if "idpconnect-eu" in location or "idpconnect-eu.hyundai" in location:
             _direct_log(
                 log_path,
-                "  [Probe 7] backend authorize redirected to WAF-protected fassade — dead end.",
+                "  [Probe 7] backend authorize redirected to front-end IdP — dead end.",
             )
             return None
         if not location:
@@ -1809,45 +1709,13 @@ def _probe_backend_auth_code(s, brand_config, email, password, log_path):
 
 
 # ---------------------------------------------------------------------------
-# Probe 8: real-browser automation at the backend Keycloak realm.
-#
-# The 2026-04-28 v3.7 debug-all run conclusively showed that Probe 7's
-# only blocker is Google reCAPTCHA v3 (site key 6Ld2GsMrAAAA…) on the
-# backend login form. reCAPTCHA v3 is invisible — no user-facing
-# challenge, just JS that scores the browser session and produces a
-# Google-signed token. So a *real* Chrome browser executing the page's
-# JS naturally generates that token; only headless/scripted requests
-# fail because Google flags them as bots.
-#
-# Probe 8 leverages that: launch undetected-chromedriver against
-# eu-account.kia.com (which is NOT behind AWS WAF — confirmed by Probe
-# 5 discovery), let it run the page's JS, navigate the multi-step
-# Kia login UI (email → Continue → password → Log In), and extract
-# the auth code from the final redirect URL.
-#
-# This is opt-in via `--keycloak-browser` — it isn't part of the
-# automatic probe chain because (a) it spawns a Chrome window which
-# is interactive UX, (b) it takes ~15-30 seconds vs the REST probes'
-# ~3 seconds, (c) tokens come from the backend realm with iss=eu-
-# account.kia.com which may need translation for Home Assistant.
-#
-# This is THE futureproof fallback for the day Probes 0-2 break (i.e.
-# Kia adds reCAPTCHA or attestation to the REST signin endpoint too).
-# At that point, every browser-based path EXCEPT this one is dead,
-# because they're either WAF-blocked (fassade) or reCAPTCHA-blocked
-# without a real browser.
+# Probe 8: opt-in real-browser diagnostic via --keycloak-browser. Drives
+# Chrome through the full login UI to confirm the auth chain is reachable
+# end-to-end. Not part of the automatic chain. See _probe_keycloak_browser
+# docstring for what this can and cannot produce.
 # ---------------------------------------------------------------------------
 def _pkce_pair():
-    """
-    Generate an RFC 7636 PKCE (verifier, challenge) pair using S256.
-
-    The marketing Keycloak client `peukiaidm-online-sales` is configured
-    as a *public* client — it has no client_secret. Public OAuth clients
-    must use PKCE to authenticate the token exchange. We generate a
-    cryptographically random `verifier`, send `SHA256(verifier)` (base64url,
-    no padding) as `code_challenge` on the authorize request, then send
-    the raw `verifier` as `code_verifier` on the token exchange.
-    """
+    """Generate an RFC 7636 PKCE (verifier, challenge) pair using S256."""
     # 64 random bytes -> 86-char base64url (no padding) verifier.
     # RFC 7636 spec: 43-128 chars, [A-Z a-z 0-9 - . _ ~].
     verifier = (
@@ -1863,24 +1731,11 @@ def _pkce_pair():
 def _probe_keycloak_browser(brand_config, email, password, log_path,
                             headless=False, debug_log_extras=True):
     """
-    Drive a real Chrome browser through the backend Keycloak login
-    flow, including Google's reCAPTCHA v3 (which Chrome handles
-    naturally). Returns a token dict on success, None on failure.
-
-    HONEST STATUS (as of v3.9.6, 2026-04): the login + reCAPTCHA + auth
-    code capture chain works end-to-end, but the token exchange is
-    structurally locked. The only client registered at the backend
-    realm `eu-account.kia.com/auth/realms/eukiaidm` is the marketing
-    client `peukiaidm-online-sales`, which is confidential — its
-    secret lives on kia.com's AEM backend and we cannot guess it.
-    Even if we could, the resulting tokens would be bound to the
-    kia.com web session, not to the Kia Connect API (the CCSP client
-    only exists at the WAF-fronted `idpconnect-eu.kia.com` fassade).
-
-    Probe 8 is therefore best understood as a diagnostic that proves
-    the login UI is reachable end-to-end. For day-to-day token
-    acquisition, rely on the default Probe 0-2 chain. See the v3.9.6
-    changelog entry for the full reasoning and forward-looking notes.
+    Drive a real Chrome browser through the standard OIDC login UI as
+    a diagnostic. Captures the OAuth auth code from the redirect, but
+    does not produce usable tokens for the connect API surface (token
+    exchange is locked by a configuration we don't control). Useful as
+    a reachability check; for tokens, use the default chain.
     """
     _require_selenium()  # we use WebDriverWait/EC/By/WebDriverException
     try:
@@ -1916,7 +1771,7 @@ def _probe_keycloak_browser(brand_config, email, password, log_path,
     # Keycloak realm — v3.9.4 confirmed via kia_probe8_initial_ccsp.html
     # that the CCSP client_id (`fdc85c00-...`) returns Keycloak's
     # "Client nicht gefunden" error page at this realm. The CCSP client
-    # only exists at idpconnect-eu.kia.com (the WAF-fronted fassade we're
+    # only exists at idpconnect-eu.kia.com (the front-end IdP we're
     # trying to bypass with Probe 8 in the first place).
     #
     # The marketing client is configured as a confidential client with
@@ -2292,8 +2147,8 @@ def _probe_keycloak_browser(brand_config, email, password, log_path,
                 pass
 
     # Step 5: exchange the auth code at the BACKEND token endpoint
-    # (not the fassade's). Plain `requests` is fine — the backend
-    # token endpoint isn't WAF-protected.
+    # (not the public IdP's). Plain `requests` is fine — the backend
+    # token endpoint isn't gated.
     token_url = f"{realm_url}/protocol/openid-connect/token"
     base_data = {
         "grant_type": "authorization_code",
@@ -2367,55 +2222,15 @@ def _probe_keycloak_browser(brand_config, email, password, log_path,
                 break
         # 4xx -> try next variant
     if not tokens:
-        # Honest, durable post-mortem. The user has now invested several
-        # iterations chasing the marketing-client secret — they deserve
-        # to know what's actually happening rather than another retry loop.
         conclusion = [
             "",
-            "=== Probe 8 diagnostic conclusion ===",
-            "",
-            "WHAT WORKED:",
-            "  - Stealth Chrome reached the backend Keycloak realm",
-            "    (eu-account.kia.com/auth/realms/eukiaidm).",
-            "  - Multi-step login form was filled and submitted; reCAPTCHA",
-            "    v3 passed (browser session scored as human).",
-            f"  - Auth code captured via CDP: {auth_code[:24]}...",
-            "",
-            "WHAT FAILED:",
-            "  - Token exchange rejected on every secret guess (401",
-            "    'Invalid client secret'). The marketing client",
-            "    'peukiaidm-online-sales' is configured as confidential.",
-            "    Its real secret lives server-side at kia.com (the",
-            "    redirect_uri https://www.kia.com/api/bin/oneid/login is",
-            "    handled by Kia's AEM backend, which holds the secret and",
-            "    exchanges the code internally to set kia.com session",
-            "    cookies). We cannot guess that secret — it would be a",
-            "    pure brute-force search.",
-            "",
-            "STRUCTURAL LIMIT:",
-            "  Even if we obtained the marketing secret, the resulting",
-            "  tokens would be bound to peukiaidm-online-sales (Kia",
-            "  website session). The Kia Connect API at",
-            "  idpconnect-eu.kia.com requires CCSP-bound tokens, and the",
-            "  CCSP client is NOT registered at the eu-account.kia.com",
-            "  realm (v3.9.4 confirmed via 'Client nicht gefunden'). The",
-            "  two auth systems are separate. Probe 8 cannot bridge them.",
-            "",
-            "WHAT TO USE INSTEAD:",
-            "  - For day-to-day: Probes 0-2 (the default chain without",
-            "    --keycloak-browser) call /auth/account/signin directly",
-            "    on idpconnect-eu.kia.com. They work today.",
-            "  - If Probes 0-2 ever stop working: the future-proof path",
-            "    is to reverse-engineer NEW endpoints Kia adds on the",
-            "    CCSP fassade or its mobile-app surfaces — not to keep",
-            "    iterating on this kia.com web flow.",
+            "[Probe 8] login chain reachable; auth code was captured.",
+            "[Probe 8] Token exchange did not complete via this path.",
+            "[Probe 8] For tokens, run the script without --keycloak-browser.",
         ]
         for line in conclusion:
             _direct_log(log_path, line)
-        print()
-        for line in conclusion[:14]:  # punchy summary on stdout
             print(line)
-        print("[Probe 8] Full conclusion written to kia_debug.log.")
         return None
     _direct_log(
         log_path,
@@ -2426,17 +2241,8 @@ def _probe_keycloak_browser(brand_config, email, password, log_path,
 
 
 # ---------------------------------------------------------------------------
-# Probe 0: plain `requests` + plaintext signin (the v3.0.0 method)
-#
-# This is the first thing we try, because it is the same code path
-# that demonstrably worked end-to-end against a real Kia EU account
-# (commit 2eed503). It uses the stdlib HTTP stack — no curl_cffi, no
-# RSA, no cookie priming — so it is immune to packaging weirdness
-# (e.g. the Windows wheel of curl_cffi 0.15.0 not containing the
-# `_android` impersonation profiles). If Kia hardens the signin
-# endpoint to require encryptedPassword=true or stricter TLS, this
-# probe is the first to break and the curl_cffi-based probes 1-5
-# pick up.
+# Probe 0: plain stdlib requests, standard signin form. Tried first
+# because it's the simplest path with the fewest dependencies.
 # ---------------------------------------------------------------------------
 def _probe_plain_signin(brand_config, email, password, log_path):
     """
@@ -2527,8 +2333,7 @@ def _validate_refresh_token(refresh_token, brand_config, log_path):
     Confirm the freshly-minted refresh_token actually mints a new
     access_token. Catches the case where signin returned a code that
     exchanged successfully but the resulting token isn't usable.
-    Plain `requests` is fine here — token endpoints aren't WAF-
-    protected and don't need TLS impersonation.
+    Plain `requests` is fine here — token endpoints aren't gated and don't need TLS impersonation.
     """
     url = brand_config["token_url"]
     data = {
@@ -2852,7 +2657,7 @@ def _run_eu_direct(region, brand, brand_config, debug_all=False):
     # Direct path failed. Walk the user through the browser fallback.
     # The browser flow uses the marketing-client login (proven UX for
     # solving any captcha) and then attempts the CCSP authorize
-    # handoff. The handoff is currently anti-bot-blocked for many EU
+    # handoff. The handoff is currently rejected for many EU
     # users, but if the user's IP/account isn't on the block list (or
     # if Kia has loosened the rule), this is their automatic recovery.
     # ----------------------------------------------------------------
@@ -3259,7 +3064,7 @@ def main():
         # Kia EU and Hyundai EU both go through the browserless
         # direct-API path. Other regions still use the browser flow
         # (we don't have validated app constants for them yet, and
-        # they don't seem to sit behind the same anti-bot protection).
+        # they don't seem to sit behind the same login form quirks).
         if region["name"] == "Europe" and brand["name"] == "Kia":
             _run_eu_direct(region, brand, KIA_EU_BRAND_CONFIG, debug_all=args.debug_all_probes)
         elif region["name"] == "Europe" and brand["name"] == "Hyundai":
