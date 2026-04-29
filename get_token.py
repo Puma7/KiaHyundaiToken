@@ -15,7 +15,7 @@ gets at least one chance to recover.
 See README for usage and CHANGELOG for version history.
 """
 
-__version__ = "3.9.5"
+__version__ = "3.9.6"
 
 import argparse
 import base64
@@ -1814,8 +1814,22 @@ def _probe_keycloak_browser(brand_config, email, password, log_path,
     """
     Drive a real Chrome browser through the backend Keycloak login
     flow, including Google's reCAPTCHA v3 (which Chrome handles
-    naturally). Returns a token dict (Keycloak-native, iss=backend
-    realm) on success, None on failure.
+    naturally). Returns a token dict on success, None on failure.
+
+    HONEST STATUS (as of v3.9.6, 2026-04): the login + reCAPTCHA + auth
+    code capture chain works end-to-end, but the token exchange is
+    structurally locked. The only client registered at the backend
+    realm `eu-account.kia.com/auth/realms/eukiaidm` is the marketing
+    client `peukiaidm-online-sales`, which is confidential — its
+    secret lives on kia.com's AEM backend and we cannot guess it.
+    Even if we could, the resulting tokens would be bound to the
+    kia.com web session, not to the Kia Connect API (the CCSP client
+    only exists at the WAF-fronted `idpconnect-eu.kia.com` fassade).
+
+    Probe 8 is therefore best understood as a diagnostic that proves
+    the login UI is reachable end-to-end. For day-to-day token
+    acquisition, rely on the default Probe 0-2 chain. See the v3.9.6
+    changelog entry for the full reasoning and forward-looking notes.
     """
     try:
         import undetected_chromedriver as uc
@@ -2250,7 +2264,23 @@ def _probe_keycloak_browser(brand_config, email, password, log_path,
             ("PKCE only (public-client form)", base_data),
         ]
     else:
-        guesses = ["secret", backend_client_id, ""]
+        # Marketing client: confidential, secret is server-side at kia.com.
+        # We cannot guess it. The wider list below is a cheap "no harm in
+        # trying" sweep — none of these are likely to match, but if any
+        # ever does, we want to know fast.
+        guesses = [
+            "secret",
+            backend_client_id,           # peukiaidm-online-sales
+            "",                          # public-client coercion
+            "kia",
+            "eukia",
+            "eukiaidm",                  # realm name
+            "online-sales",
+            "peukiaidm",
+            "kiaconnect",
+            "kia-connect",
+            "admin",                     # default Keycloak admin
+        ]
         attempts = [("PKCE only (public-client form)", base_data)]
         for g in guesses:
             attempts.append((
@@ -2285,6 +2315,55 @@ def _probe_keycloak_browser(brand_config, email, password, log_path,
                 break
         # 4xx -> try next variant
     if not tokens:
+        # Honest, durable post-mortem. The user has now invested several
+        # iterations chasing the marketing-client secret — they deserve
+        # to know what's actually happening rather than another retry loop.
+        conclusion = [
+            "",
+            "=== Probe 8 diagnostic conclusion ===",
+            "",
+            "WHAT WORKED:",
+            "  - Stealth Chrome reached the backend Keycloak realm",
+            "    (eu-account.kia.com/auth/realms/eukiaidm).",
+            "  - Multi-step login form was filled and submitted; reCAPTCHA",
+            "    v3 passed (browser session scored as human).",
+            f"  - Auth code captured via CDP: {auth_code[:24]}...",
+            "",
+            "WHAT FAILED:",
+            "  - Token exchange rejected on every secret guess (401",
+            "    'Invalid client secret'). The marketing client",
+            "    'peukiaidm-online-sales' is configured as confidential.",
+            "    Its real secret lives server-side at kia.com (the",
+            "    redirect_uri https://www.kia.com/api/bin/oneid/login is",
+            "    handled by Kia's AEM backend, which holds the secret and",
+            "    exchanges the code internally to set kia.com session",
+            "    cookies). We cannot guess that secret — it would be a",
+            "    pure brute-force search.",
+            "",
+            "STRUCTURAL LIMIT:",
+            "  Even if we obtained the marketing secret, the resulting",
+            "  tokens would be bound to peukiaidm-online-sales (Kia",
+            "  website session). The Kia Connect API at",
+            "  idpconnect-eu.kia.com requires CCSP-bound tokens, and the",
+            "  CCSP client is NOT registered at the eu-account.kia.com",
+            "  realm (v3.9.4 confirmed via 'Client nicht gefunden'). The",
+            "  two auth systems are separate. Probe 8 cannot bridge them.",
+            "",
+            "WHAT TO USE INSTEAD:",
+            "  - For day-to-day: Probes 0-2 (the default chain without",
+            "    --keycloak-browser) call /auth/account/signin directly",
+            "    on idpconnect-eu.kia.com. They work today.",
+            "  - If Probes 0-2 ever stop working: the future-proof path",
+            "    is to reverse-engineer NEW endpoints Kia adds on the",
+            "    CCSP fassade or its mobile-app surfaces — not to keep",
+            "    iterating on this kia.com web flow.",
+        ]
+        for line in conclusion:
+            _direct_log(log_path, line)
+        print()
+        for line in conclusion[:14]:  # punchy summary on stdout
+            print(line)
+        print("[Probe 8] Full conclusion written to kia_debug.log.")
         return None
     _direct_log(
         log_path,

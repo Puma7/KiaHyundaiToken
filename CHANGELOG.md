@@ -1,5 +1,63 @@
 # Changelog
 
+## [3.9.6] - 2026-04-29
+
+### Honest disposition for Probe 8 + expanded secret-guess sweep
+
+The v3.9.5 run was a clean end-to-end success on the login chain:
+state-machine traversed the 3-step UI cleanly (`step 0: initial ->
+click Anmelden`, `step 1: email -> Weiter`, `step 2: password ->
+submit`), reCAPTCHA passed, auth code captured via CDP. But the
+token exchange returned 401 `Invalid client secret` on every variant
+of the secret-guess list, including PKCE-only.
+
+After enough iterations to be sure: **the marketing client
+`peukiaidm-online-sales` is confidential and its real secret cannot
+be reached.** It lives on kia.com's AEM backend and is used by Kia's
+own server-side handler at `https://www.kia.com/api/bin/oneid/login`
+to exchange the auth code internally and set kia.com session cookies.
+We see exactly that flow play out in the URL chain — that's the
+intended consumer of the auth code, not us.
+
+### Two changes:
+
+1. **Wider secret-guess sweep** (cheap shot, no harm): the variant
+   list now also tries `"kia"`, `"eukia"`, `"eukiaidm"` (the realm
+   name), `"online-sales"`, `"peukiaidm"`, `"kiaconnect"`,
+   `"kia-connect"`, and `"admin"` — both with and without PKCE. None
+   are likely to win, but if any ever does, we want to find out fast.
+
+2. **Honest diagnostic conclusion**: when all variants fail, Probe 8
+   now writes a structured post-mortem to `kia_debug.log` AND prints
+   a punchy summary to stdout. The conclusion explains:
+
+   - **What worked**: stealth Chrome -> backend Keycloak login ->
+     reCAPTCHA pass -> auth code capture.
+   - **What failed and why**: the marketing client is confidential;
+     its secret lives on kia.com's backend.
+   - **The structural limit**: even with the secret, the resulting
+     tokens would only be valid for kia.com's web session, not for
+     the Kia Connect API at `idpconnect-eu.kia.com`. The CCSP client
+     is NOT registered at the backend Keycloak realm (v3.9.4
+     confirmed via the literal "Client nicht gefunden" error page).
+     The two auth systems are separate and cannot be bridged.
+   - **What to use instead**: Probes 0-2 (the default chain without
+     `--keycloak-browser`) hit `/auth/account/signin` directly on
+     `idpconnect-eu.kia.com` and produce CCSP tokens that work today.
+     If those ever break, the future-proof path is to reverse-
+     engineer Kia's NEW endpoints, not to keep iterating on the
+     kia.com web flow.
+
+### Status
+
+Probe 8 is now correctly framed as a diagnostic — the login UI is
+proven reachable end-to-end, useful when investigating future
+changes to Kia's auth surface, but it does not produce tokens. The
+default chain (Probes 0-2) remains the working path for users.
+
+The function docstring of `_probe_keycloak_browser` was updated to
+say so plainly. No changes to the user-facing default flow.
+
 ## [3.9.5] - 2026-04-29
 
 ### Fixed — Probe 8 multi-step login UI + CCSP hypothesis disproved
