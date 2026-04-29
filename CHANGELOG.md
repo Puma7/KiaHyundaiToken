@@ -1,5 +1,62 @@
 # Changelog
 
+## [3.9.1] - 2026-04-29
+
+### Fixed — Probe 8 timing race
+
+The v3.9.0 first run produced extremely useful diagnostic data: the
+saved `kia_probe8_timeout.html` file revealed that the post-login
+URL was Kia's 404 page (`<title>404-page - en | Kia Motors Europe
+</title>`). What that means: the OAuth login through the backend
+Keycloak realm DID succeed, reCAPTCHA v3 DID pass, the `?code=…`
+redirect DID fire — but Kia's `https://www.kia.com/api/bin/oneid/login`
+URL is not a real handler. It's a registered OAuth `redirect_uri`
+target, and Kia's website 404 handler routes the request to
+`/api/bin/oneid/q` for analytics tracking. So the URL with `code=`
+flashes by for less than 500ms before the browser navigates away.
+
+v3.9.0 used `WebDriverWait` with the default 500ms poll interval,
+which was too slow to catch that transient URL. v3.9.1 fixes it
+with three layers of capture:
+
+1. **Tight URL polling**: 100ms interval (5× faster than v3.9.0).
+2. **Full URL chain tracking**: every URL change is appended to a
+   list and searched for `code=`. Even if the URL with `code=` only
+   exists for one poll cycle, it's preserved.
+3. **CDP performance log fallback**: Chrome's network event log is
+   drained each iteration, so navigation events that happened too
+   fast for the URL polling are still captured. `goog:loggingPrefs:
+   {performance: ALL}` is set on the Chrome options.
+
+Also fixed a subtle bug: v3.9.0 read `driver.current_url` twice in
+a row (once for chain init, once for the log message) which on a
+fast-navigating browser could let the URL change between the two
+reads — losing the very URL we were trying to capture. Now the
+initial read is cached.
+
+### Added — better diagnostics
+
+- The full URL chain observed during the post-login wait is now
+  always logged (one line per URL), so even if Probe 8 fails the
+  log shows exactly which redirects happened.
+- `kia_probe8_final.html` is saved on every Probe 8 run (not just
+  on timeout) so the post-login page can be inspected.
+- The "no auth code observed" failure message now lists three
+  concrete possible causes for the user to investigate.
+
+### Status
+
+Probe 8 should now successfully extract `code=` from the transient
+post-login URL on a typical run, complete the token exchange at
+the backend Keycloak token endpoint, and return Keycloak-native
+tokens (with `iss=eu-account.kia.com/auth/realms/eukiaidm`).
+
+13-check smoke test green: tight polling catches transient code=,
+CDP fallback catches code= when current_url misses, kia_probe8_final.html
+saved every run, reCAPTCHA failure detection still works, structural
+invariants (goog:loggingPrefs, 100ms poll, full-chain search,
+initial-URL-cached) all verified.
+
 ## [3.9.0] - 2026-04-28
 
 ### Added — Probe 8 (futureproof fallback)

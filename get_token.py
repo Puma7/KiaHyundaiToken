@@ -15,12 +15,13 @@ gets at least one chance to recover.
 See README for usage and CHANGELOG for version history.
 """
 
-__version__ = "3.9.0"
+__version__ = "3.9.1"
 
 import argparse
 import base64
 import datetime as dt
 import getpass
+import json
 import os
 import random
 import re
@@ -1830,6 +1831,20 @@ def _probe_keycloak_browser(brand_config, email, password, log_path,
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/130.0.0.0 Safari/537.36"
     )
+    # Enable Chrome's performance log so we can drain it during the
+    # post-login wait — catches transient URLs (the OAuth redirect with
+    # code= flashes by quickly because Kia's /api/bin/oneid/login is a
+    # registered redirect_uri but its 404 handler immediately routes
+    # away to /api/bin/oneid/q for analytics tracking).
+    try:
+        options.set_capability(
+            "goog:loggingPrefs",
+            {"performance": "ALL", "browser": "ALL"},
+        )
+    except Exception:
+        # uc.ChromeOptions may not support set_capability on every
+        # build — non-fatal, the fallback is plain URL polling.
+        pass
 
     driver = None
     try:
@@ -1881,37 +1896,135 @@ def _probe_keycloak_browser(brand_config, email, password, log_path,
         login_btn2 = driver.find_element(By.ID, "BtnLogin")
         driver.execute_script("arguments[0].click();", login_btn2)
 
-        # Step 4: wait for the redirect-with-code OR an error.
-        # On success: URL becomes https://www.kia.com/api/bin/oneid/login?code=…
-        # On failure: URL stays at eu-account.kia.com with an error in the page,
-        #             OR redirects but shows recaptcha_failed_v3 etc.
-        _direct_log(log_path, "  [Probe 8] Waiting for redirect with code (up to 60s)...")
-        redirect_wait = WebDriverWait(driver, 60)
-        try:
-            redirect_wait.until(
-                lambda d: ("code=" in d.current_url and "kia.com" in d.current_url)
-                or "/error" in d.current_url
-                or "recaptcha_failed" in (d.page_source or "")
-            )
-        except TimeoutException:
-            _direct_log(log_path, f"  [Probe 8] timed out waiting for redirect; current_url={driver.current_url}")
-            if debug_log_extras:
+        # Step 4: tight-poll for the redirect with code= in URL.
+        #
+        # The OAuth redirect after Keycloak login goes to:
+        #   https://www.kia.com/api/bin/oneid/login?code=…&state=ccsp
+        # which then 404s on Kia's website (the redirect_uri is registered
+        # at Keycloak but doesn't have a real handler at kia.com — it's
+        # just a "drop the code on this URL" target). Kia's 404 handler
+        # then routes to /api/bin/oneid/q (analytics tracker?) and the
+        # browser sits there.
+        #
+        # The transient URL with code= flashes by quickly. v3.9.0 used
+        # WebDriverWait with default 500ms poll which missed it. v3.9.1
+        # tight-polls at 100ms AND tracks the full URL chain — even if
+        # the URL with code= is only there for a moment, it ends up in
+        # the chain and we extract the code from there.
+        #
+        # We also drain the CDP performance log (if available) which
+        # captures every navigation event including ones that happened
+        # too fast for our polling.
+        _direct_log(log_path, "  [Probe 8] Tight-polling for redirect with code= (up to 60s)...")
+        # Cache the initial URL — never call driver.current_url twice in
+        # a row, the browser may navigate between reads (especially right
+        # after we just clicked Log In and reCAPTCHA fired).
+        initial_url = driver.current_url
+        url_chain = [initial_url]
+        _direct_log(log_path, f"    URL: {_safe_truncate(initial_url, 200)}")
+        deadline = time.time() + 60
+        auth_code = None
+        recaptcha_blocked = False
+
+        def _scan_for_code(url):
+            m = re.search(r"[?&]code=([^&]+)", url or "")
+            return m.group(1) if m else None
+
+        while time.time() < deadline:
+            try:
+                cur = driver.current_url
+            except WebDriverException as exc:
+                _direct_log(log_path, f"    URL read failed: {exc}")
+                break
+            if cur != url_chain[-1]:
+                url_chain.append(cur)
+                _direct_log(log_path, f"    URL: {_safe_truncate(cur, 200)}")
+
+            # Search every URL we've observed (current + history) for code=
+            for url in url_chain:
+                code = _scan_for_code(url)
+                if code:
+                    auth_code = code
+                    _direct_log(
+                        log_path,
+                        f"  [Probe 8] auth code captured from URL: "
+                        f"{_safe_truncate(url, 200)}",
+                    )
+                    break
+            if auth_code:
+                break
+
+            # Drain CDP performance log to catch URLs we polled too slow for.
+            # uc may or may not have set goog:loggingPrefs — try-except either way.
+            try:
+                perf_logs = driver.get_log("performance")
+                for entry in perf_logs:
+                    try:
+                        msg = json.loads(entry["message"])["message"]
+                    except (KeyError, ValueError):
+                        continue
+                    if msg.get("method") not in (
+                        "Network.requestWillBeSent",
+                        "Network.responseReceived",
+                        "Page.frameNavigated",
+                    ):
+                        continue
+                    params = msg.get("params", {}) or {}
+                    candidate_urls = []
+                    if "request" in params:
+                        candidate_urls.append(params["request"].get("url", ""))
+                    if "response" in params:
+                        candidate_urls.append(params["response"].get("url", ""))
+                    if "frame" in params:
+                        candidate_urls.append(params["frame"].get("url", ""))
+                    candidate_urls.append(params.get("documentURL", ""))
+                    for u in candidate_urls:
+                        if u and u not in url_chain:
+                            url_chain.append(u)
+                            _direct_log(log_path, f"    CDP URL: {_safe_truncate(u, 200)}")
+                        code = _scan_for_code(u)
+                        if code:
+                            auth_code = code
+                            _direct_log(
+                                log_path,
+                                f"  [Probe 8] auth code captured via CDP: "
+                                f"{_safe_truncate(u, 200)}",
+                            )
+                            break
+                    if auth_code:
+                        break
+            except (WebDriverException, Exception):
+                pass
+            if auth_code:
+                break
+
+            # Bail if we hit a Keycloak error or reCAPTCHA failure
+            if "/error" in cur or "recaptcha_failed" in cur:
+                # Quickly check page source for error marker — limit read size
                 try:
-                    log_dir = os.path.dirname(log_path) or "."
-                    with open(os.path.join(log_dir, "kia_probe8_timeout.html"), "w", encoding="utf-8") as f:
-                        f.write(driver.page_source or "")
-                    _direct_log(log_path, "  [Probe 8] saved page source to kia_probe8_timeout.html")
-                except OSError:
-                    pass
-            return None
+                    src_head = (driver.page_source or "")[:5000]
+                except WebDriverException:
+                    src_head = ""
+                if "recaptcha_failed" in src_head or "/error" in cur:
+                    recaptcha_blocked = True
+                    break
 
-        current_url = driver.current_url
-        _direct_log(log_path, f"  [Probe 8] post-login URL: {_safe_truncate(current_url, 200)}")
+            time.sleep(0.1)
 
-        # Capture cookies from this session for the token-exchange call —
-        # Keycloak issues HttpOnly session cookies that the exchange
-        # request shouldn't actually need (auth code is enough), but
-        # log them for diagnostic purposes.
+        # Always save GET + post-login HTML for diagnostics
+        try:
+            log_dir = os.path.dirname(log_path) or "."
+            with open(os.path.join(log_dir, "kia_probe8_final.html"),
+                      "w", encoding="utf-8") as f:
+                f.write(driver.page_source or "")
+        except (OSError, WebDriverException):
+            pass
+
+        # Log the full URL chain we observed
+        _direct_log(log_path, f"  [Probe 8] full URL chain ({len(url_chain)} entries):")
+        for u in url_chain:
+            _direct_log(log_path, f"    -> {_safe_truncate(u, 220)}")
+
         if debug_log_extras:
             try:
                 cookies = driver.get_cookies()
@@ -1919,24 +2032,25 @@ def _probe_keycloak_browser(brand_config, email, password, log_path,
             except Exception:
                 pass
 
-        if "/error" in current_url or "recaptcha_failed" in (driver.page_source or ""):
-            page_src = driver.page_source or ""
-            err_m = re.search(r'recaptcha_failed_v\d', page_src)
-            error_marker = err_m.group(0) if err_m else "(error page)"
+        if recaptcha_blocked:
             _direct_log(
                 log_path,
-                f"  [Probe 8] login rejected: {error_marker}. "
-                "Google's reCAPTCHA v3 score was below Kia's accept threshold. "
-                "Try non-headless mode (drop --keycloak-browser-headless), or "
-                "use the same browser profile repeatedly to build trust.",
+                "  [Probe 8] login rejected (reCAPTCHA score below threshold). "
+                "Try without --keycloak-browser-headless, or run a few times "
+                "to build browser-profile trust with Google.",
             )
             return None
 
-        match = re.search(r"[?&]code=([^&]+)", current_url)
-        if not match:
-            _direct_log(log_path, f"  [Probe 8] no code= in final URL")
+        if not auth_code:
+            _direct_log(
+                log_path,
+                "  [Probe 8] no auth code observed in any URL. "
+                "Possible reasons: login form structure changed, reCAPTCHA "
+                "took longer than 60s, or Kia's redirect URI handler "
+                "no longer carries the code.",
+            )
             return None
-        auth_code = match.group(1)
+
         _direct_log(log_path, "  [Probe 8] got auth code from real-browser Keycloak login")
 
     except WebDriverException as exc:
