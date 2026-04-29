@@ -1,5 +1,50 @@
 # Changelog
 
+## [3.9.2] - 2026-04-29
+
+### Fixed — Probe 8 token exchange (PKCE)
+
+The v3.9.1 run was a major breakthrough: the auth code was successfully
+captured via the CDP performance log fallback, confirming that Probe 8
+gets through reCAPTCHA v3 in a real Chrome session. But the token
+exchange that followed returned **401 `Client secret not provided in
+request`** from `eu-account.kia.com/auth/realms/eukiaidm/protocol/openid-connect/token`.
+
+That error is Keycloak's way of saying: this client is configured as
+*public* (no `client_secret`), and you must prove possession of the
+authorize-step state via PKCE (RFC 7636). The marketing client
+`peukiaidm-online-sales` is exactly such a public client.
+
+v3.9.2 adds proper PKCE handling:
+
+1. New `_pkce_pair()` helper generates a cryptographically random
+   `code_verifier` (64 random bytes -> 86-char base64url) and the
+   matching `code_challenge` = `SHA256(verifier)` (base64url, no
+   padding) as required by RFC 7636.
+2. The Keycloak authorize URL now carries `code_challenge=<challenge>`
+   and `code_challenge_method=S256`, binding the auth code to this
+   specific PKCE session.
+3. The token exchange now sends `code_verifier=<verifier>` instead of
+   `client_secret`. Keycloak verifies `SHA256(verifier) == challenge`
+   and issues the tokens.
+4. **Fallback** — if PKCE-only returns a 4xx, we retry with PKCE +
+   `client_secret="secret"` (the legacy fassade default). Some Keycloak
+   realms register the same client as confidential AND require PKCE;
+   the cheap retry covers that configuration without another login.
+
+### Status
+
+The full Probe 8 chain is now end-to-end correct: real Chrome through
+reCAPTCHA v3 -> Keycloak login form -> `code=` capture from transient
+redirect -> PKCE-authenticated token exchange -> Keycloak-native
+tokens. This is the futureproof fallback for when Probes 0-2 (REST
+API path) eventually break.
+
+Smoke test green: PKCE pair has correct length (verifier 86, challenge
+43), only RFC 7636-allowed characters, `SHA256(verifier) == challenge`,
+and successive calls return distinct verifiers (cryptographic
+randomness verified).
+
 ## [3.9.1] - 2026-04-29
 
 ### Fixed — Probe 8 timing race

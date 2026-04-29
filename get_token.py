@@ -15,16 +15,18 @@ gets at least one chance to recover.
 See README for usage and CHANGELOG for version history.
 """
 
-__version__ = "3.9.1"
+__version__ = "3.9.2"
 
 import argparse
 import base64
 import datetime as dt
 import getpass
+import hashlib
 import json
 import os
 import random
 import re
+import secrets
 import shutil
 import time
 
@@ -1784,6 +1786,29 @@ def _probe_backend_auth_code(s, brand_config, email, password, log_path):
 # because they're either WAF-blocked (fassade) or reCAPTCHA-blocked
 # without a real browser.
 # ---------------------------------------------------------------------------
+def _pkce_pair():
+    """
+    Generate an RFC 7636 PKCE (verifier, challenge) pair using S256.
+
+    The marketing Keycloak client `peukiaidm-online-sales` is configured
+    as a *public* client — it has no client_secret. Public OAuth clients
+    must use PKCE to authenticate the token exchange. We generate a
+    cryptographically random `verifier`, send `SHA256(verifier)` (base64url,
+    no padding) as `code_challenge` on the authorize request, then send
+    the raw `verifier` as `code_verifier` on the token exchange.
+    """
+    # 64 random bytes -> 86-char base64url (no padding) verifier.
+    # RFC 7636 spec: 43-128 chars, [A-Z a-z 0-9 - . _ ~].
+    verifier = (
+        base64.urlsafe_b64encode(secrets.token_bytes(64))
+        .rstrip(b"=")
+        .decode("ascii")
+    )
+    digest = hashlib.sha256(verifier.encode("ascii")).digest()
+    challenge = base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
+    return verifier, challenge
+
+
 def _probe_keycloak_browser(brand_config, email, password, log_path,
                             headless=False, debug_log_extras=True):
     """
@@ -1807,6 +1832,12 @@ def _probe_keycloak_browser(brand_config, email, password, log_path,
         _direct_log(log_path, "  [Probe 8] backend_realm_url / marketing_* not configured, skipping.")
         return None
 
+    # PKCE — required because peukiaidm-online-sales is a public client
+    # (no client_secret). Without code_challenge on the authorize request
+    # plus code_verifier on the token exchange, the token endpoint returns
+    # 401 "Client secret not provided in request" (observed in v3.9.1).
+    code_verifier, code_challenge = _pkce_pair()
+
     auth_url = (
         f"{realm_url}/protocol/openid-connect/auth"
         f"?client_id={backend_client_id}"
@@ -1814,11 +1845,14 @@ def _probe_keycloak_browser(brand_config, email, password, log_path,
         f"&redirect_uri={backend_redirect}"
         "&state=ccsp"
         "&scope=openid"
+        f"&code_challenge={code_challenge}"
+        "&code_challenge_method=S256"
     )
 
     _direct_log(log_path, f"\n=== Probe 8: real-browser Keycloak login ===")
     _direct_log(log_path, f"  auth URL: {auth_url}")
     _direct_log(log_path, f"  headless: {headless}")
+    _direct_log(log_path, f"  PKCE challenge sent (S256, verifier kept for token exchange)")
 
     options = uc.ChromeOptions()
     options.add_argument("--start-maximized")
@@ -2069,37 +2103,56 @@ def _probe_keycloak_browser(brand_config, email, password, log_path,
     # Step 5: exchange the auth code at the BACKEND token endpoint
     # (not the fassade's). Plain `requests` is fine — the backend
     # token endpoint isn't WAF-protected.
+    #
+    # We try two variants in order:
+    #   (a) PKCE only: code_verifier, no client_secret. This is the spec
+    #       form for public clients, and it's what peukiaidm-online-sales
+    #       is configured as in Kia's Keycloak realm.
+    #   (b) PKCE + fassade secret "secret": some Keycloak realms register
+    #       the same client as confidential AND require PKCE. Cheap retry.
     token_url = f"{realm_url}/protocol/openid-connect/token"
-    _direct_log(log_path, f"\n  [Probe 8 — Token exchange] POST {token_url}")
-    try:
-        resp = requests.post(
-            token_url,
-            data={
-                "grant_type": "authorization_code",
-                "code": auth_code,
-                "redirect_uri": backend_redirect,
-                "client_id": backend_client_id,
-            },
-            timeout=30,
-        )
-    except requests.RequestException as exc:
-        _direct_log(log_path, f"  [Probe 8 token exchange] network error: {exc}")
+    base_data = {
+        "grant_type": "authorization_code",
+        "code": auth_code,
+        "redirect_uri": backend_redirect,
+        "client_id": backend_client_id,
+        "code_verifier": code_verifier,
+    }
+    attempts = [
+        ("PKCE only (public client)", base_data),
+        ("PKCE + client_secret='secret'",
+         {**base_data, "client_secret": "secret"}),
+    ]
+    tokens = None
+    for label, data in attempts:
+        _direct_log(log_path, f"\n  [Probe 8 — Token exchange] {label} -> POST {token_url}")
+        try:
+            resp = requests.post(token_url, data=data, timeout=30)
+        except requests.RequestException as exc:
+            _direct_log(log_path, f"  [Probe 8 token exchange] network error: {exc}")
+            return None
+        _log_response(log_path, f"Probe 8 token exchange ({label})", resp)
+        if resp.status_code == 200:
+            try:
+                parsed = resp.json()
+            except ValueError:
+                parsed = None
+            if parsed and parsed.get("refresh_token") and parsed.get("access_token"):
+                tokens = parsed
+                _direct_log(
+                    log_path,
+                    f"  [Probe 8] token exchange variant '{label}' SUCCEEDED.",
+                )
+                break
+        # 4xx -> try next variant
+    if not tokens:
         return None
-    _log_response(log_path, "Probe 8 token exchange", resp)
-    if resp.status_code != 200:
-        return None
-    try:
-        tokens = resp.json()
-    except ValueError:
-        return None
-    if tokens.get("refresh_token") and tokens.get("access_token"):
-        _direct_log(
-            log_path,
-            "  [Probe 8] real-browser Keycloak login SUCCEEDED — "
-            "Keycloak-native tokens (iss = backend realm).",
-        )
-        return tokens
-    return None
+    _direct_log(
+        log_path,
+        "  [Probe 8] real-browser Keycloak login SUCCEEDED — "
+        "Keycloak-native tokens (iss = backend realm).",
+    )
+    return tokens
 
 
 # ---------------------------------------------------------------------------
