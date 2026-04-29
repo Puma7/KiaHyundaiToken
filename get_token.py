@@ -15,7 +15,7 @@ gets at least one chance to recover.
 See README for usage and CHANGELOG for version history.
 """
 
-__version__ = "3.9.4"
+__version__ = "3.9.5"
 
 import argparse
 import base64
@@ -1846,24 +1846,24 @@ def _probe_keycloak_browser(brand_config, email, password, log_path,
             "&code_challenge_method=S256"
         )
 
-    # Two configurations, tried in order. CCSP is preferred (we know
-    # its secret) but might not be registered at this realm. Marketing
-    # is the proven-to-render-login-form fallback (v3.9.2 captured an
-    # auth code through it). On marketing, the token exchange may fail
-    # — we still try a list of plausible secrets.
-    ccsp_cfg = {
-        "label": "ccsp",
-        "client_id": brand_config.get("client_id"),
-        "redirect": brand_config.get("redirect_uri"),
-        "secret": brand_config.get("client_secret"),
-    }
+    # Marketing client is the only one that works at the backend
+    # Keycloak realm — v3.9.4 confirmed via kia_probe8_initial_ccsp.html
+    # that the CCSP client_id (`fdc85c00-...`) returns Keycloak's
+    # "Client nicht gefunden" error page at this realm. The CCSP client
+    # only exists at idpconnect-eu.kia.com (the WAF-fronted fassade we're
+    # trying to bypass with Probe 8 in the first place).
+    #
+    # The marketing client is configured as a confidential client with
+    # an unknown secret, so the token exchange tries a guess list (see
+    # below). Even if no guess wins, the captured auth code + URL chain
+    # are valuable diagnostic data.
     mkt_cfg = {
         "label": "marketing",
         "client_id": brand_config.get("marketing_client_id"),
         "redirect": brand_config.get("marketing_redirect_uri"),
         "secret": None,  # not known — token exchange uses guess list
     }
-    candidates = [c for c in (ccsp_cfg, mkt_cfg)
+    candidates = [c for c in (mkt_cfg,)
                   if c["client_id"] and c["redirect"]]
     if not candidates:
         _direct_log(log_path, "  [Probe 8] no usable client config (need either CCSP or marketing).")
@@ -1937,12 +1937,18 @@ def _probe_keycloak_browser(brand_config, email, password, log_path,
                 pass
 
             # 5s wait: form ready, or this candidate is rejected.
+            # Watch for #BtnLogin (the "Anmelden" button) — it's always
+            # present on the working multi-step login page regardless of
+            # which step is active, and it's NOT present on Keycloak's
+            # error page (which has no form action at all). Watching for
+            # #FormEmail directly fails on the new 3-step UI because the
+            # email field is `display: none` until step 1->2 is reached.
             try:
                 WebDriverWait(driver, 5).until(
-                    EC.element_to_be_clickable((By.ID, "FormEmail"))
+                    EC.element_to_be_clickable((By.ID, "BtnLogin"))
                 )
                 active_cfg = cfg
-                _direct_log(log_path, f"  [Probe 8] [{cfg['label']}] login form ready.")
+                _direct_log(log_path, f"  [Probe 8] [{cfg['label']}] login form ready (BtnLogin clickable).")
                 break
             except TimeoutException:
                 # Diagnose Keycloak's response.
@@ -1982,39 +1988,69 @@ def _probe_keycloak_browser(brand_config, email, password, log_path,
         backend_redirect = active_cfg["redirect"]
         backend_secret = active_cfg["secret"]
 
-        wait = WebDriverWait(driver, 30)
+        # Step 2: drive Kia's multi-step login form via a state machine.
+        #
+        # As of late April 2026, Kia uses a 3-step UI:
+        #   step 1: only "Anmelden"/"Registrieren" buttons visible
+        #           (#FormEmail and #FormPassword both display:none)
+        #   step 2: #FormEmail visible (#FormPassword still hidden),
+        #           BtnLogin text becomes "Weiter"
+        #   step 3: #FormPassword visible, BtnLogin text becomes
+        #           "Anmelden", clicking it triggers reCAPTCHA + submit
+        #
+        # Earlier versions of the UI sometimes skip step 1 (the form
+        # opens directly with email field visible). Rather than
+        # hardcoding any one variant, we loop and detect which step is
+        # active by checking #FormPassword > #FormEmail > else
+        # ("initial step, click Anmelden to advance").
 
-        # Step 2: fill email, click Continue
-        # Kia's custom Keycloak theme has a multi-step UI:
-        #   step 2: email field visible (#FormEmail) + button "Continue"
-        #   step 3: password field visible (#FormPassword) + button "Log In"
-        _direct_log(log_path, f"  [Probe 8] [{chosen_label}] Filling email...")
-        email_field = wait.until(
-            EC.element_to_be_clickable((By.ID, "FormEmail"))
-        )
-        email_field.clear()
-        email_field.send_keys(email)
-        time.sleep(0.5)  # let JS validators settle
+        def _is_visible(loc):
+            els = driver.find_elements(*loc)
+            if not els:
+                return False
+            try:
+                return els[0].is_displayed()
+            except WebDriverException:
+                return False
 
-        _direct_log(log_path, "  [Probe 8] Clicking Continue...")
-        login_btn = wait.until(EC.element_to_be_clickable((By.ID, "BtnLogin")))
-        # Use JS click — bypasses any visibility issues with overlays
-        driver.execute_script("arguments[0].click();", login_btn)
-
-        # Step 3: wait for password field, fill, click Log In
-        _direct_log(log_path, "  [Probe 8] Waiting for password field...")
-        pwd_field = wait.until(
-            EC.visibility_of_element_located((By.ID, "FormPassword"))
-        )
-        # Extra wait — JS animation, focus transition, etc.
-        time.sleep(1.0)
-        pwd_field.clear()
-        pwd_field.send_keys(password)
-        time.sleep(0.5)
-
-        _direct_log(log_path, "  [Probe 8] Clicking Log In (triggers reCAPTCHA + form submit)...")
-        login_btn2 = driver.find_element(By.ID, "BtnLogin")
-        driver.execute_script("arguments[0].click();", login_btn2)
+        _direct_log(log_path, f"  [Probe 8] [{chosen_label}] Driving multi-step form...")
+        login_submitted = False
+        for step in range(5):
+            time.sleep(1.0)  # let JS animations/transitions settle
+            if _is_visible((By.ID, "FormPassword")):
+                _direct_log(log_path, f"  [Probe 8] step {step}: password field visible -> fill + submit")
+                pwd_field = driver.find_element(By.ID, "FormPassword")
+                pwd_field.clear()
+                pwd_field.send_keys(password)
+                time.sleep(0.5)
+                btn = driver.find_element(By.ID, "BtnLogin")
+                driver.execute_script("arguments[0].click();", btn)
+                login_submitted = True
+                break
+            elif _is_visible((By.ID, "FormEmail")):
+                _direct_log(log_path, f"  [Probe 8] step {step}: email field visible -> fill + Weiter")
+                em_field = driver.find_element(By.ID, "FormEmail")
+                em_field.clear()
+                em_field.send_keys(email)
+                time.sleep(0.5)
+                btn = driver.find_element(By.ID, "BtnLogin")
+                driver.execute_script("arguments[0].click();", btn)
+            else:
+                _direct_log(log_path, f"  [Probe 8] step {step}: initial screen -> click Anmelden")
+                try:
+                    btn = driver.find_element(By.ID, "BtnLogin")
+                    driver.execute_script("arguments[0].click();", btn)
+                except WebDriverException as exc:
+                    _direct_log(log_path, f"  [Probe 8] step {step}: BtnLogin not found: {exc}")
+                    return None
+        if not login_submitted:
+            _direct_log(
+                log_path,
+                "  [Probe 8] could not reach the password step within 5 form-step iterations. "
+                "Either the UI structure changed or focus was stolen by a cookie banner.",
+            )
+            return None
+        _direct_log(log_path, "  [Probe 8] form submitted (reCAPTCHA fires asynchronously)")
 
         # Step 4: tight-poll for the redirect with code= in URL.
         #

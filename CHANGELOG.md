@@ -1,5 +1,78 @@
 # Changelog
 
+## [3.9.5] - 2026-04-29
+
+### Fixed — Probe 8 multi-step login UI + CCSP hypothesis disproved
+
+The v3.9.4 diagnostics dump (`kia_probe8_initial_*.html`) gave us
+ground truth on two questions:
+
+**1. Is the CCSP client registered at `eu-account.kia.com/auth/realms/eukiaidm`?**
+**No.** `kia_probe8_initial_ccsp.html` shows Keycloak's themed error
+page with the literal text "Es ist ein Fehler aufgetreten. Client
+nicht gefunden." So my v3.9.3 hypothesis was wrong — the CCSP client
+only lives at `idpconnect-eu.kia.com` (the WAF-fronted fassade we're
+trying to bypass), not at the backend Keycloak realm. There's no path
+through Probe 8 to a CCSP-bound auth code; only the marketing client
+works at this realm. Removed CCSP from the candidate list with an
+explanatory comment.
+
+**2. Why did the v3.9.4 form-readiness check time out on the marketing
+candidate too, when v3.9.2 had captured the auth code through it?**
+`kia_probe8_initial_marketing.html` showed the form HTML still loads,
+but the structure changed: it's now a **3-step UI**.
+
+```html
+<div class="input" id="RStep1" style="display: none;">
+  <input id="FormEmail" ...>
+</div>
+<div class="input" id="RStep2" style="display:none;">
+  <input id="FormPassword" ...>
+</div>
+```
+
+Both input fields start `display: none`. Only `#BtnLogin` is visible
+on step 1 (alongside `#BtnRegister`). Clicking BtnLogin advances
+through the steps:
+- step 1 → 2: reveals `#FormEmail`, BtnLogin text becomes "Weiter"
+- step 2 → 3: reveals `#FormPassword`, BtnLogin text becomes "Anmelden"
+- step 3: clicking BtnLogin triggers reCAPTCHA + form submit
+
+v3.9.2 worked because that day's UI was a 2-step variant where
+`#FormEmail` was visible from the start. Kia rolled out a 3-step
+variant since.
+
+### Two fixes:
+
+1. **Form-readiness check now watches `#BtnLogin`** (the always-visible
+   "Anmelden"/"Weiter" button) instead of `#FormEmail` (which is
+   `display: none` until step 1→2 advances). BtnLogin is also a more
+   reliable signal that the page is the working login form vs. an
+   error page — Keycloak's error page has no BtnLogin at all.
+2. **State-machine login flow**: rather than hard-coding email→Weiter→
+   password→submit, the code now loops up to 5 iterations checking
+   visibility of `#FormPassword` > `#FormEmail` > else. On each
+   iteration it fills the visible field (or just clicks BtnLogin on
+   the initial screen) and re-evaluates. Works for 1-step (legacy),
+   2-step (v3.9.2-era), and 3-step (current April 2026) UIs without
+   any branch-specific logic.
+
+### Status
+
+If the marketing client still accepts our PKCE flow at all (it does
+require a secret, but per v3.9.2's run-with-this-realm-it-renders-
+the-form data we know the authorize step works), we should now reach
+the auth-code capture cleanly. Token exchange continues to try the
+guess list (PKCE-only, then plausible secret guesses). Even if no
+secret guess wins, we'll have a clean auth code in the URL chain
+that proves the UI traversal succeeded — useful for forensics when
+designing a Probe 9.
+
+Smoke test green: candidates list contains only marketing, BtnLogin
+is the form-readiness check, `_is_visible` helper + 5-iteration state
+machine, login_submitted flag tracked, all PKCE/secret-guess token
+exchange logic from v3.9.4 retained.
+
 ## [3.9.4] - 2026-04-29
 
 ### Fixed — Probe 8 falls back to marketing client; early diagnostics

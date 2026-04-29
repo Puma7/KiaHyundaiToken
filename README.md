@@ -1,4 +1,4 @@
-# KiaHyundaiToken v3.9.4
+# KiaHyundaiToken v3.9.5
 
 Get your **Kia** or **Hyundai** OAuth2 refresh token — worldwide.
 
