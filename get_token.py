@@ -15,7 +15,7 @@ gets at least one chance to recover.
 See README for usage and CHANGELOG for version history.
 """
 
-__version__ = "3.9.3"
+__version__ = "3.9.4"
 
 import argparse
 import base64
@@ -1826,50 +1826,52 @@ def _probe_keycloak_browser(brand_config, email, password, log_path,
         ) from exc
 
     realm_url = brand_config.get("backend_realm_url")
-    # v3.9.3: switched from the marketing client (peukiaidm-online-sales)
-    # to the CCSP client (the mobile-app client_id from brand_config).
-    #
-    # WHY: the v3.9.2 run proved that Probe 8 captures the auth code
-    # cleanly via the marketing client + reCAPTCHA flow, but the token
-    # exchange returned 401 "Client secret not provided" (PKCE-only)
-    # and 401 "Invalid client secret" (PKCE + 'secret'). The marketing
-    # client is configured as confidential in Kia's Keycloak realm,
-    # and its real secret is server-side at kia.com — not in our reach.
-    #
-    # The CCSP client lives in the SAME Keycloak realm (eu-account.kia.com
-    # is the standard-Keycloak surface of the same backend that
-    # idpconnect-eu.kia.com fronts via its API). Its secret is the
-    # literal string "secret" (yes, really — that's the value used by
-    # hyundai_kia_connect_api for years and confirmed working). So we
-    # initiate the authorize step with the CCSP client_id + CCSP
-    # redirect_uri, get an auth code bound to the CCSP client, and
-    # exchange it with the known secret.
-    backend_client_id = brand_config.get("client_id")
-    backend_redirect = brand_config.get("redirect_uri")
-    backend_secret = brand_config.get("client_secret")
-    if not realm_url or not backend_client_id or not backend_redirect:
-        _direct_log(log_path, "  [Probe 8] backend_realm_url / client_id / redirect_uri not configured, skipping.")
+    if not realm_url:
+        _direct_log(log_path, "  [Probe 8] backend_realm_url not configured, skipping.")
         return None
 
-    # PKCE — belt-and-suspenders. The CCSP client has a secret, so
-    # PKCE isn't strictly required by Keycloak, but recent Keycloak
-    # builds enable PKCE for all clients by default and reject bare
-    # auth-code exchanges. Sending both costs nothing.
+    # PKCE — belt-and-suspenders. Some Keycloak configs require it
+    # for confidential clients too.
     code_verifier, code_challenge = _pkce_pair()
 
-    auth_url = (
-        f"{realm_url}/protocol/openid-connect/auth"
-        f"?client_id={backend_client_id}"
-        "&response_type=code"
-        f"&redirect_uri={backend_redirect}"
-        "&state=ccsp"
-        "&scope=openid"
-        f"&code_challenge={code_challenge}"
-        "&code_challenge_method=S256"
-    )
+    def _build_auth_url(cid, redir):
+        return (
+            f"{realm_url}/protocol/openid-connect/auth"
+            f"?client_id={cid}"
+            "&response_type=code"
+            f"&redirect_uri={redir}"
+            "&state=ccsp"
+            "&scope=openid"
+            f"&code_challenge={code_challenge}"
+            "&code_challenge_method=S256"
+        )
+
+    # Two configurations, tried in order. CCSP is preferred (we know
+    # its secret) but might not be registered at this realm. Marketing
+    # is the proven-to-render-login-form fallback (v3.9.2 captured an
+    # auth code through it). On marketing, the token exchange may fail
+    # — we still try a list of plausible secrets.
+    ccsp_cfg = {
+        "label": "ccsp",
+        "client_id": brand_config.get("client_id"),
+        "redirect": brand_config.get("redirect_uri"),
+        "secret": brand_config.get("client_secret"),
+    }
+    mkt_cfg = {
+        "label": "marketing",
+        "client_id": brand_config.get("marketing_client_id"),
+        "redirect": brand_config.get("marketing_redirect_uri"),
+        "secret": None,  # not known — token exchange uses guess list
+    }
+    candidates = [c for c in (ccsp_cfg, mkt_cfg)
+                  if c["client_id"] and c["redirect"]]
+    if not candidates:
+        _direct_log(log_path, "  [Probe 8] no usable client config (need either CCSP or marketing).")
+        return None
 
     _direct_log(log_path, f"\n=== Probe 8: real-browser Keycloak login ===")
-    _direct_log(log_path, f"  auth URL: {auth_url}")
+    _direct_log(log_path, f"  realm: {realm_url}")
+    _direct_log(log_path, f"  authorize candidates: {[c['label'] for c in candidates]}")
     _direct_log(log_path, f"  headless: {headless}")
     _direct_log(log_path, f"  PKCE challenge sent (S256, verifier kept for token exchange)")
 
@@ -1911,9 +1913,74 @@ def _probe_keycloak_browser(brand_config, email, password, log_path,
         )
         driver.set_page_load_timeout(60)
 
-        # Step 1: navigate to backend Keycloak login
-        _direct_log(log_path, "\n  [Probe 8] Loading login page...")
-        driver.get(auth_url)
+        # Step 1: navigate to backend Keycloak login. Try each
+        # client-config candidate; keep the first one whose authorize
+        # response actually renders the login form.
+        active_cfg = None
+        for cfg in candidates:
+            cur_auth_url = _build_auth_url(cfg["client_id"], cfg["redirect"])
+            _direct_log(log_path, f"\n  [Probe 8] [{cfg['label']}] Loading auth URL...")
+            _direct_log(log_path, f"    {_safe_truncate(cur_auth_url, 220)}")
+            try:
+                driver.get(cur_auth_url)
+            except WebDriverException as exc:
+                _direct_log(log_path, f"  [Probe 8] [{cfg['label']}] navigation error: {exc}")
+                continue
+
+            # Dump initial page source for forensics regardless of outcome.
+            try:
+                log_dir = os.path.dirname(log_path) or "."
+                with open(os.path.join(log_dir, f"kia_probe8_initial_{cfg['label']}.html"),
+                          "w", encoding="utf-8") as f:
+                    f.write(driver.page_source or "")
+            except (OSError, WebDriverException):
+                pass
+
+            # 5s wait: form ready, or this candidate is rejected.
+            try:
+                WebDriverWait(driver, 5).until(
+                    EC.element_to_be_clickable((By.ID, "FormEmail"))
+                )
+                active_cfg = cfg
+                _direct_log(log_path, f"  [Probe 8] [{cfg['label']}] login form ready.")
+                break
+            except TimeoutException:
+                # Diagnose Keycloak's response.
+                try:
+                    cur_url = driver.current_url
+                    src_head = (driver.page_source or "")[:5000]
+                except WebDriverException:
+                    cur_url, src_head = "", ""
+                _direct_log(log_path, f"  [Probe 8] [{cfg['label']}] form not visible after 5s.")
+                _direct_log(log_path, f"    URL: {_safe_truncate(cur_url, 220)}")
+                # Keycloak shows error pages with kc-feedback-text spans
+                m = re.search(
+                    r'<span[^>]*class="kc-feedback-text"[^>]*>([^<]+)</span>',
+                    src_head, re.IGNORECASE,
+                )
+                if m:
+                    _direct_log(log_path, f"    Keycloak feedback: {m.group(1).strip()}")
+                # Common Keycloak error markers
+                for marker in ("invalid_redirect_uri", "Client not found",
+                               "We are sorry", "/error?", "Unauthorized",
+                               "Access denied", "We're sorry"):
+                    if marker.lower() in (cur_url + " " + src_head).lower():
+                        _direct_log(log_path, f"    error marker '{marker}' detected.")
+                        break
+
+        if not active_cfg:
+            _direct_log(
+                log_path,
+                "  [Probe 8] no client config produced a login form. "
+                "Inspect kia_probe8_initial_*.html files to see Keycloak's responses.",
+            )
+            return None
+
+        # Use whichever config rendered the form for the rest of the flow.
+        chosen_label = active_cfg["label"]
+        backend_client_id = active_cfg["client_id"]
+        backend_redirect = active_cfg["redirect"]
+        backend_secret = active_cfg["secret"]
 
         wait = WebDriverWait(driver, 30)
 
@@ -1921,7 +1988,7 @@ def _probe_keycloak_browser(brand_config, email, password, log_path,
         # Kia's custom Keycloak theme has a multi-step UI:
         #   step 2: email field visible (#FormEmail) + button "Continue"
         #   step 3: password field visible (#FormPassword) + button "Log In"
-        _direct_log(log_path, "  [Probe 8] Waiting for email field...")
+        _direct_log(log_path, f"  [Probe 8] [{chosen_label}] Filling email...")
         email_field = wait.until(
             EC.element_to_be_clickable((By.ID, "FormEmail"))
         )
@@ -2125,11 +2192,6 @@ def _probe_keycloak_browser(brand_config, email, password, log_path,
     # Step 5: exchange the auth code at the BACKEND token endpoint
     # (not the fassade's). Plain `requests` is fine — the backend
     # token endpoint isn't WAF-protected.
-    #
-    # The auth code was issued for the CCSP client, whose secret is
-    # the literal string "secret" (long-known constant from
-    # hyundai_kia_connect_api). We send PKCE alongside for the
-    # belt-and-suspenders reason explained at the top of this fn.
     token_url = f"{realm_url}/protocol/openid-connect/token"
     base_data = {
         "grant_type": "authorization_code",
@@ -2138,17 +2200,32 @@ def _probe_keycloak_browser(brand_config, email, password, log_path,
         "client_id": backend_client_id,
         "code_verifier": code_verifier,
     }
-    # Primary: CCSP secret (known constant). Fallbacks cover the case
-    # where Kia rotated the secret or the backend Keycloak realm
-    # rejects PKCE on confidential clients (some setups do).
-    attempts = [
-        ("CCSP secret + PKCE",
-         {**base_data, "client_secret": backend_secret}),
-        ("CCSP secret without PKCE",
-         {k: v for k, v in {**base_data, "client_secret": backend_secret}.items()
-          if k != "code_verifier"}),
-        ("PKCE only (public-client form)", base_data),
-    ]
+    # Build the variant list dynamically based on which client we used.
+    # CCSP path: known secret first.
+    # Marketing path: secret unknown, try public-client form + plausible
+    # guesses (literal "secret", client_id-as-secret, empty string).
+    if backend_secret:
+        attempts = [
+            (f"{chosen_label} secret + PKCE",
+             {**base_data, "client_secret": backend_secret}),
+            (f"{chosen_label} secret without PKCE",
+             {k: v for k, v in {**base_data, "client_secret": backend_secret}.items()
+              if k != "code_verifier"}),
+            ("PKCE only (public-client form)", base_data),
+        ]
+    else:
+        guesses = ["secret", backend_client_id, ""]
+        attempts = [("PKCE only (public-client form)", base_data)]
+        for g in guesses:
+            attempts.append((
+                f"PKCE + client_secret={g!r}",
+                {**base_data, "client_secret": g},
+            ))
+            attempts.append((
+                f"client_secret={g!r} (no PKCE)",
+                {k: v for k, v in {**base_data, "client_secret": g}.items()
+                 if k != "code_verifier"},
+            ))
     tokens = None
     for label, data in attempts:
         _direct_log(log_path, f"\n  [Probe 8 — Token exchange] {label} -> POST {token_url}")

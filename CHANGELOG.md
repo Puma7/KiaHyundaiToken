@@ -1,5 +1,59 @@
 # Changelog
 
+## [3.9.4] - 2026-04-29
+
+### Fixed — Probe 8 falls back to marketing client; early diagnostics
+
+The v3.9.3 run failed earlier than v3.9.2: the CCSP `client_id`
+(`fdc85c00-...`) is **not registered** at the backend Keycloak realm
+`eu-account.kia.com/auth/realms/eukiaidm`. After `driver.get(auth_url)`
+Keycloak rendered an error page — but our 30-second wait for
+`#FormEmail` then ran into a TimeoutException, and the user only saw
+the empty-message stacktrace from chromedriver. No diagnostic data on
+*what* Keycloak actually said.
+
+Two architectural fixes:
+
+1. **Authorize candidates with fallback**: Probe 8 now builds a
+   prioritized list of `(client_id, redirect_uri, secret)` tuples
+   (CCSP first, marketing second) and tries each. For each candidate
+   it navigates, dumps the rendered page source to
+   `kia_probe8_initial_<label>.html`, and waits 5 seconds for the
+   login form. If the form appears, that candidate is "live" — the
+   rest of the flow (login + code capture + token exchange) uses its
+   credentials. If not, the next candidate is tried in the same
+   browser session. v3.9.3's failure mode (CCSP rejected, no fallback)
+   is gone — even if CCSP doesn't work at this realm, we fall through
+   to the marketing client (which v3.9.2 proved renders the form).
+
+2. **Early Keycloak-error detection + dump**: when the form doesn't
+   appear within 5s, we extract Keycloak's `<span class="kc-feedback-text">`
+   error message, scan the URL + page source for known markers
+   (`invalid_redirect_uri`, `Client not found`, `/error?`, etc.),
+   and log them. The page source is always saved to disk before
+   continuing, so post-mortem inspection is one file open away.
+
+3. **Dynamic token-exchange variants**: when the active candidate has
+   a known secret (CCSP path), variants are CCSP-secret±PKCE → PKCE-only.
+   When the secret is unknown (marketing path), variants are PKCE-only
+   first, then PKCE + plausible-guess pairs ("secret", `client_id`-as-
+   secret, empty string), each with and without PKCE. Casts a wide net
+   without any further user interaction needed.
+
+### Status
+
+If v3.9.3's hypothesis was right (CCSP client at this realm), the
+CCSP path now produces tokens. If it was wrong, we automatically fall
+through to the marketing client and the user sees a complete URL
+chain + `kia_probe8_initial_marketing.html` revealing exactly how
+Keycloak responds to each authorize attempt.
+
+Smoke test green: candidates list built, initial page-source dumps
+named per label, 5s short wait + 30s long wait wired correctly,
+Keycloak error-message extraction in place, dynamic token-exchange
+variant builder verified for both secret-known and secret-unknown
+paths.
+
 ## [3.9.3] - 2026-04-29
 
 ### Fixed — Probe 8 token exchange (CCSP client switch)
