@@ -10,7 +10,7 @@ Get your **Kia** or **Hyundai** OAuth2 refresh token — worldwide.
 | **Europe** | **Hyundai** | **Direct API login** — same flow as Kia. Experimental. |
 | China, Australia, New Zealand, India, Brazil | Kia and/or Hyundai | One-time browser login. Untested — community validation needed. |
 
-Why two methods? In late 2025 Kia and Hyundai added stricter anti-bot protection on their EU login servers, which interferes with browser-based OAuth flows. For EU users the script uses a non-browser path that talks to the same API endpoints the official mobile app uses, with the same TLS fingerprint, the same RSA-encrypted credential format, and the same request shape — so no Chrome window opens at all. Other regions still use the browser flow because they don't need the alternate path.
+Why two methods? In late 2025 Kia and Hyundai added stricter anti-bot protection on their EU login servers, which interferes with browser-based OAuth flows. For EU users the script uses a non-browser path that hits the same REST API endpoints the official mobile app uses. The first probe sends the password over TLS in plaintext (the standard signin form); if that gets rejected, later probes match the mobile app more closely (curl_cffi TLS impersonation, RSA-encrypted password matching the app's wire format, cookie priming) and try again. No Chrome window opens for any of this. Other regions still use the browser flow because they don't sit behind the same anti-bot protection.
 
 > **USA / Canada:** These regions use a different authentication method (direct API login, no browser required). Most integrations (e.g. Home Assistant) handle authentication directly for these regions — you typically do not need this tool.
 
@@ -20,14 +20,14 @@ Why two methods? In late 2025 Kia and Hyundai added stricter anti-bot protection
 
 Treat your **refresh token like a password**. Anyone who has it can access your Kia or Hyundai account and vehicle data (location, lock/unlock, climate, charging) for up to a year. Store it only in a password manager or your Home Assistant secrets file.
 
-For EU direct mode: your password is **RSA-encrypted client-side** with a public key fetched from the IdP (same way the official mobile app does it) before being sent. Credentials only ever go to Kia's or Hyundai's own endpoints (`idpconnect-eu.kia.com` / `idpconnect-eu.hyundai.com`). They are never written to disk in plaintext, never sent to a third party, never logged. The terminal hides your password while you type it.
+For EU direct mode: credentials only ever go to Kia's or Hyundai's own endpoints (`idpconnect-eu.kia.com` / `idpconnect-eu.hyundai.com`) over HTTPS. The first probe submits the standard signin form (password in TLS-encrypted POST body); if that fails, a fallback probe also adds an RSA layer on top of TLS, mimicking the mobile app's wire format. In every probe, credentials are never written to disk in plaintext, never sent to a third party, never logged (only response bodies are logged, and the IdP doesn't echo passwords back). The terminal hides your password while you type it.
 
 ## Requirements
 
 - Windows 10 or 11 (also works on macOS / Linux with Python)
 - [Git for Windows](https://git-scm.com/download/win)
 - Python 3.10 or newer
-- Google Chrome (only for non-EU regions or Hyundai EU — Kia EU uses no browser)
+- Google Chrome (only needed for non-EU regions, or as the recovery fallback if the EU direct path fails — Kia EU and Hyundai EU both use the no-browser direct API by default)
 
 For browser-based flows, ChromeDriver is installed **automatically** — the script detects your Chrome version and downloads the matching driver on first run.
 
@@ -152,7 +152,7 @@ Set-ExecutionPolicy -Scope CurrentUser RemoteSigned
 
 ### Lost or compromised refresh token
 
-Just run the script again — it always issues a fresh token. The old one becomes invalid as soon as the new one is used.
+Just run the script again — every login issues a fresh token. Old tokens may stay valid for a while in parallel (the IdP doesn't always invalidate them on new issuance), so if you suspect compromise, also change your account password on Kia's/Hyundai's website.
 
 ## Contributing
 
