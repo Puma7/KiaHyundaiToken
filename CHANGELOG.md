@@ -1,5 +1,57 @@
 # Changelog
 
+## [3.9.3] - 2026-04-29
+
+### Fixed — Probe 8 token exchange (CCSP client switch)
+
+The v3.9.2 run was the second major breakthrough in two days: the
+auth-code capture was rock solid, the URL chain showed the full OAuth
+dance through reCAPTCHA v3 and the Keycloak login form, the captured
+code reached the token endpoint cleanly. Token exchange returned:
+
+- **PKCE only**: `401 Client secret not provided in request`
+- **PKCE + client_secret='secret'**: `401 Invalid client secret`
+
+These responses tell us conclusively that the marketing client
+`peukiaidm-online-sales` is configured as **confidential** in Kia's
+Keycloak realm (it requires a real secret), and `"secret"` is not its
+secret. The real one lives server-side at kia.com — we cannot get it.
+
+But the same Keycloak realm at `eu-account.kia.com/auth/realms/eukiaidm`
+also fronts the **CCSP client** (`fdc85c00-0a2f-4c64-bcb4-2cfb1500730a`
+— the mobile-app client_id), and that client's secret IS public:
+literally the string `"secret"` (long-known constant from the
+`hyundai_kia_connect_api` library). So v3.9.3 switches Probe 8 to:
+
+1. **Authorize step**: use the CCSP `client_id` and CCSP `redirect_uri`
+   (`https://prd.eu-ccapi.kia.com:8080/api/v1/user/oauth2/redirect`)
+   instead of the marketing client. The login form is identical (it's
+   the same Keycloak realm), but the resulting auth code is bound to
+   the CCSP client.
+2. **Token exchange**: present the known CCSP secret along with PKCE.
+   Try three variants in order: CCSP secret + PKCE (primary), CCSP
+   secret without PKCE (fallback for legacy realms), PKCE-only
+   (fallback for the day Kia reconfigures CCSP as a public client).
+
+The CCSP redirect URL is internal (port 8080 on `prd.eu-ccapi.kia.com`),
+so the browser navigation will fail with `NET_ERR_CONNECTION_REFUSED`
+— but Chrome fires the `Network.requestWillBeSent` CDP event with the
+full `?code=...` URL BEFORE any connection attempt, so the v3.9.1 CDP
+capture path picks it up cleanly. No change needed to the post-login
+wait loop.
+
+### Status
+
+End-to-end Probe 8 chain v3 — should now produce real Keycloak-native
+tokens for the CCSP client, equivalent to what the EU mobile app
+gets. Same audience/issuer as the regular Probes 0-2, suitable for
+direct use with Home Assistant and `hyundai_kia_connect_api`.
+
+Smoke test green: version 3.9.3, Probe 8 references `brand_config["client_id"]`
++ `["redirect_uri"]` + `["client_secret"]`, the three token-exchange
+variants are wired up, PKCE is still attached, KIA_EU_BRAND_CONFIG
+constants verified.
+
 ## [3.9.2] - 2026-04-29
 
 ### Fixed — Probe 8 token exchange (PKCE)

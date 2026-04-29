@@ -15,7 +15,7 @@ gets at least one chance to recover.
 See README for usage and CHANGELOG for version history.
 """
 
-__version__ = "3.9.2"
+__version__ = "3.9.3"
 
 import argparse
 import base64
@@ -1826,16 +1826,35 @@ def _probe_keycloak_browser(brand_config, email, password, log_path,
         ) from exc
 
     realm_url = brand_config.get("backend_realm_url")
-    backend_client_id = brand_config.get("marketing_client_id")
-    backend_redirect = brand_config.get("marketing_redirect_uri")
+    # v3.9.3: switched from the marketing client (peukiaidm-online-sales)
+    # to the CCSP client (the mobile-app client_id from brand_config).
+    #
+    # WHY: the v3.9.2 run proved that Probe 8 captures the auth code
+    # cleanly via the marketing client + reCAPTCHA flow, but the token
+    # exchange returned 401 "Client secret not provided" (PKCE-only)
+    # and 401 "Invalid client secret" (PKCE + 'secret'). The marketing
+    # client is configured as confidential in Kia's Keycloak realm,
+    # and its real secret is server-side at kia.com — not in our reach.
+    #
+    # The CCSP client lives in the SAME Keycloak realm (eu-account.kia.com
+    # is the standard-Keycloak surface of the same backend that
+    # idpconnect-eu.kia.com fronts via its API). Its secret is the
+    # literal string "secret" (yes, really — that's the value used by
+    # hyundai_kia_connect_api for years and confirmed working). So we
+    # initiate the authorize step with the CCSP client_id + CCSP
+    # redirect_uri, get an auth code bound to the CCSP client, and
+    # exchange it with the known secret.
+    backend_client_id = brand_config.get("client_id")
+    backend_redirect = brand_config.get("redirect_uri")
+    backend_secret = brand_config.get("client_secret")
     if not realm_url or not backend_client_id or not backend_redirect:
-        _direct_log(log_path, "  [Probe 8] backend_realm_url / marketing_* not configured, skipping.")
+        _direct_log(log_path, "  [Probe 8] backend_realm_url / client_id / redirect_uri not configured, skipping.")
         return None
 
-    # PKCE — required because peukiaidm-online-sales is a public client
-    # (no client_secret). Without code_challenge on the authorize request
-    # plus code_verifier on the token exchange, the token endpoint returns
-    # 401 "Client secret not provided in request" (observed in v3.9.1).
+    # PKCE — belt-and-suspenders. The CCSP client has a secret, so
+    # PKCE isn't strictly required by Keycloak, but recent Keycloak
+    # builds enable PKCE for all clients by default and reject bare
+    # auth-code exchanges. Sending both costs nothing.
     code_verifier, code_challenge = _pkce_pair()
 
     auth_url = (
@@ -1932,23 +1951,26 @@ def _probe_keycloak_browser(brand_config, email, password, log_path,
 
         # Step 4: tight-poll for the redirect with code= in URL.
         #
-        # The OAuth redirect after Keycloak login goes to:
-        #   https://www.kia.com/api/bin/oneid/login?code=…&state=ccsp
-        # which then 404s on Kia's website (the redirect_uri is registered
-        # at Keycloak but doesn't have a real handler at kia.com — it's
-        # just a "drop the code on this URL" target). Kia's 404 handler
-        # then routes to /api/bin/oneid/q (analytics tracker?) and the
-        # browser sits there.
+        # The OAuth redirect after Keycloak login goes to the CCSP
+        # redirect_uri:
+        #   https://prd.eu-ccapi.kia.com:8080/api/v1/user/oauth2/redirect?code=...
+        # That host:port is internal (Kia's CCSP backend listens here),
+        # so the browser will fail to connect from the public internet
+        # — but Keycloak issues a 302 to that URL FIRST, and Chrome
+        # fires a Network.requestWillBeSent CDP event with the full
+        # `?code=...` URL BEFORE the connection is even attempted. So
+        # we still capture the code from the URL chain even though the
+        # navigation itself dies with NET_ERR_CONNECTION_REFUSED.
         #
-        # The transient URL with code= flashes by quickly. v3.9.0 used
-        # WebDriverWait with default 500ms poll which missed it. v3.9.1
-        # tight-polls at 100ms AND tracks the full URL chain — even if
-        # the URL with code= is only there for a moment, it ends up in
-        # the chain and we extract the code from there.
+        # The URL flashes by quickly. v3.9.0 used WebDriverWait with
+        # default 500ms poll which missed it. v3.9.1 tight-polls at
+        # 100ms AND tracks the full URL chain — even if the URL with
+        # code= only exists for one poll cycle, it lands in the chain
+        # and we extract the code from there.
         #
-        # We also drain the CDP performance log (if available) which
+        # We also drain the CDP performance log every iteration, which
         # captures every navigation event including ones that happened
-        # too fast for our polling.
+        # too fast for plain URL polling.
         _direct_log(log_path, "  [Probe 8] Tight-polling for redirect with code= (up to 60s)...")
         # Cache the initial URL — never call driver.current_url twice in
         # a row, the browser may navigate between reads (especially right
@@ -2104,12 +2126,10 @@ def _probe_keycloak_browser(brand_config, email, password, log_path,
     # (not the fassade's). Plain `requests` is fine — the backend
     # token endpoint isn't WAF-protected.
     #
-    # We try two variants in order:
-    #   (a) PKCE only: code_verifier, no client_secret. This is the spec
-    #       form for public clients, and it's what peukiaidm-online-sales
-    #       is configured as in Kia's Keycloak realm.
-    #   (b) PKCE + fassade secret "secret": some Keycloak realms register
-    #       the same client as confidential AND require PKCE. Cheap retry.
+    # The auth code was issued for the CCSP client, whose secret is
+    # the literal string "secret" (long-known constant from
+    # hyundai_kia_connect_api). We send PKCE alongside for the
+    # belt-and-suspenders reason explained at the top of this fn.
     token_url = f"{realm_url}/protocol/openid-connect/token"
     base_data = {
         "grant_type": "authorization_code",
@@ -2118,10 +2138,16 @@ def _probe_keycloak_browser(brand_config, email, password, log_path,
         "client_id": backend_client_id,
         "code_verifier": code_verifier,
     }
+    # Primary: CCSP secret (known constant). Fallbacks cover the case
+    # where Kia rotated the secret or the backend Keycloak realm
+    # rejects PKCE on confidential clients (some setups do).
     attempts = [
-        ("PKCE only (public client)", base_data),
-        ("PKCE + client_secret='secret'",
-         {**base_data, "client_secret": "secret"}),
+        ("CCSP secret + PKCE",
+         {**base_data, "client_secret": backend_secret}),
+        ("CCSP secret without PKCE",
+         {k: v for k, v in {**base_data, "client_secret": backend_secret}.items()
+          if k != "code_verifier"}),
+        ("PKCE only (public-client form)", base_data),
     ]
     tokens = None
     for label, data in attempts:
