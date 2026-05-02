@@ -85,6 +85,33 @@ python -m pip install -r requirements.txt
 python get_token.py
 ```
 
+## macOS / Linux
+
+The same shell commands work on both macOS and Linux. Copy the entire block below into a terminal and press Enter.
+
+If your system uses `python3` for Python 3 instead of `python`, use `python3` in the commands below.
+
+```bash
+# Always start fresh — sweeps any broken/partial clone first
+rm -rf /tmp/KiaHyundaiToken
+git clone https://github.com/Puma7/KiaHyundaiToken.git /tmp/KiaHyundaiToken
+cd /tmp/KiaHyundaiToken
+
+# (Re)create a clean virtual environment
+python3 -m venv .venv
+source .venv/bin/activate
+
+# Install dependencies (always use 'python', not 'py', inside a venv)
+python -m ensurepip --upgrade
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
+
+# Run
+python get_token.py
+```
+
+If `python3` is not available but `python` already points to Python 3, you can use `python -m venv .venv` instead of `python3 -m venv .venv`.
+
 ### Why `python` and not `py`?
 
 After activating a virtual environment, always use **`python`** (not `py`). `py` may invoke a different Python interpreter than the one inside your venv, which causes `ModuleNotFoundError` even though you just installed the packages.
