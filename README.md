@@ -56,7 +56,7 @@ Type **Y** and press Enter when prompted.
 
 After pasting, **press Enter once**. All commands run automatically.
 
-## Quick Start
+## Quick Start Windows
 
 Copy the **entire gray block** below, paste it into PowerShell, and press Enter. Everything runs automatically.
 
